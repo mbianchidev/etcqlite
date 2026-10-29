@@ -8,6 +8,7 @@ existing server. Repository state: documentation only. Actions: disabled.
 | Document | Purpose |
 | --- | --- |
 | [Requirements](requirements.md) | Confirmed requirements, proposed product boundary, non-goals, and success criteria |
+| [Alternatives and positioning](alternatives.md) | Competitor comparison, proposed USP, evidence boundaries, and reuse decisions |
 | [Implementation plan](implementation-plan.md) | Ordered work packages, dependencies, deliverables, and stop/go gates |
 | [Architecture](architecture.md) | Components, execution model, request paths, and consistency boundaries |
 | [Storage](storage.md) | SQLite schema, MVCC, revisions, persistence, compaction, and schema evolution |

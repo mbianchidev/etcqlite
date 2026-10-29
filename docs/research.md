@@ -5,20 +5,10 @@ not independent production certification of any referenced project.
 
 ## Existing implementations
 
-| Project | Verified overlap | Boundary relevant to Etcqlite |
-| --- | --- | --- |
-| [Kine](https://github.com/k3s-io/kine) | etcd v3 API over SQLite and other backends; used by K3s | README explicitly limits scope to Kubernetes' subset and SQLite to one instance |
-| [k8s-dqlite](https://github.com/canonical/k8s-dqlite) | Kubernetes etcd replacement over distributed SQLite | HA uses Raft |
-| [Rhino](https://github.com/calfonso/rhino) | Rust etcd facade supporting SQLite and other backends | Source rejects lease keepalive/revoke and many maintenance methods despite broad README language |
-| [T4](https://github.com/t4db/t4) | Non-Raft etcd-compatible store with replication, watches, transactions and leases | Uses Pebble and S3-based coordination, not SQLite |
-| [rqlite](https://github.com/rqlite/rqlite) | Distributed SQLite and strong consistency options | Uses Raft and SQL/HTTP rather than the etcd API |
-| [LiteFS](https://docs.fly.io/litefs/faq) | SQLite replica distribution and failover integration | Async replication can lose recent writes; not an etcd consensus replacement |
-| [Addendum](https://github.com/bigeasy/addendum) | Paxos-based etcd-like implementation | README identifies a JavaScript proof of concept for etcd v2, not this v3/SQLite contract |
-| [Sqlited](https://github.com/sqlited-org/sqlited) | Existing SQLite-related project using the proposed alternative name | PostgreSQL-wire project; not verified as a full etcd-compatible non-Raft solution |
-
-The combination of SQLite, complete client semantics, native non-Raft HA,
-and these integrations was not established as a mature existing product by
-this search. That is a bounded search finding, not proof of novelty.
+The [alternatives and positioning comparison](alternatives.md) is the
+canonical competitor list. It separates client-facing replacements, adjacent
+SQLite tools, and consensus building blocks, and explains the proposed USP.
+This document retains the implementation references and source-level caveats.
 
 ## Important source-level caveats
 

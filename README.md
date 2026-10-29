@@ -11,6 +11,8 @@ manifest, build configuration, or CI workflow.**
 
 - [Full implementation plan](docs/implementation-plan.md): milestones,
   dependencies, work packages, acceptance gates, and delivery order.
+- [Alternatives and positioning](docs/alternatives.md): existing options,
+  potential differentiators, and when not to build Etcqlite.
 - [Requirements](docs/requirements.md): confirmed constraints, proposed scope,
   compatibility claims, and performance objectives.
 - [Documentation index](docs/README.md): architecture, storage, consensus,
