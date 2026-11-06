@@ -1,0 +1,26 @@
+[package]
+name = "etcqlite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "SQLite-backed etcd-compatible storage with non-Raft consensus"
+publish = false
+
+[dependencies]
+omnipaxos = { path = "vendor/omnipaxos", default-features = false, features = ["serde"] }
+rusqlite = { version = "=0.41.1", features = ["bundled", "backup"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+sha2 = "=0.11.1"
+thiserror = "=2.0.21"
+
+[dev-dependencies]
+omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos", rev = "9c772dcce5a9652192f45f67d9d2208b306f3bc9", default-features = false }
+tempfile = "=3.27.0"
+
+[patch."https://github.com/haraldng/omnipaxos"]
+omnipaxos = { path = "vendor/omnipaxos" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

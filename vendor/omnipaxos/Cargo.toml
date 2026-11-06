@@ -1,0 +1,30 @@
+[package]
+name = "omnipaxos"
+version = "0.2.4"
+edition = "2021"
+description = "Etcqlite's maintained OmniPaxos core from revision 9c772dc"
+readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/haraldng/omnipaxos"
+publish = false
+
+[dependencies]
+slog = { version = "2.7.0", optional = true }
+slog-term = { version = "2.9.0", optional = true }
+slog-async = { version = "2.7.0", optional = true }
+serde = { version = "1.0", optional = true, features = ["derive"] }
+toml = { version = "0.7.3", optional = true }
+omnipaxos_macros = { git = "https://github.com/haraldng/omnipaxos", rev = "9c772dcce5a9652192f45f67d9d2208b306f3bc9", optional = true }
+lru = { version = "0.11.0", optional = true }
+num-traits = { version = "0.2.16", optional = true }
+linked_hash_set = { version = "0.1.4", optional = true }
+uuid = { version = "1", optional = true, features = ["v4"] }
+
+[features]
+logging = ["slog", "slog-term", "slog-async"]
+toml_config = ["serde", "toml"]
+macros = ["omnipaxos_macros"]
+unicache = ["lru", "num-traits", "linked_hash_set"]
+async_runtime = ["dep:uuid"]
+serde = ["dep:serde", "uuid?/serde"]
+default = ["macros"]

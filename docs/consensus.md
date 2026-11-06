@@ -1,6 +1,8 @@
 # Non-Raft consensus and failover
 
-Status: candidate design. No protocol implementation is approved or present.
+Status: experimental implementation. An explicitly approved local fork and
+SQLite persistence adapter are present. Bounded M0 evidence is not production
+or multi-host qualification.
 
 ## Selection
 
@@ -14,6 +16,44 @@ an immutable implementation revision during M0.
 Implement its persistence interface on SQLite rather than shipping its
 RocksDB-backed storage implementation. This is real protocol-storage work,
 not a drop-in database-driver substitution.
+
+## M0 result and maintained fork
+
+The initial simulation failed against immutable upstream revision
+`9c772dcce5a9652192f45f67d9d2208b306f3bc9`, also the latest upstream revision
+when checked. Both SQLite and upstream memory storage reproduced the failure;
+it was not hidden by weakening the oracle or disabling synchronization.
+
+During delta snapshot synchronization, `sync_log` advanced its cached decided
+frontier before building the receiver's existing snapshot. The merge could
+then include an old leader's undecided suffix, or lose a committed prefix,
+while labeling the result with the new decided position.
+
+The owner explicitly approved maintaining a local fork on 2026-11-07.
+`vendor/omnipaxos` retains upstream's Apache-2.0 license and source. The local
+change constructs the snapshot from the old decided frontier, stages cache
+updates, commits the atomic storage batch, and only then publishes those
+cache updates. The fork is not an independent new consensus algorithm.
+
+`tests/protocol_simulation.rs` includes the minimized delta regression,
+partitioned old-leader fencing, restart, snapshot/suffix catch-up, a
+non-voting learner/reconfiguration model, real target-leader attempts,
+duplicate/reordered/lost messages, and ignored-storage-error poisoning.
+The history oracle checks overlapping decided prefixes throughout seeded
+runs and preserves acknowledged history. Proposal admission is not mistaken
+for a client acknowledgment; unacknowledged dropped proposals are retried
+after connectivity returns.
+
+`tests/protocol_storage.rs` covers durable atomic batches, process exit
+without destructors, rollback, absolute indexes, snapshot/StopSign recovery,
+counter/ballot bounds, and checksums. The adapter uses WAL, `FULL` sync,
+macOS full-sync pragmas, and a poison flag that the runtime must check before
+emitting messages or serving requests.
+
+These are short, one-host M0 spikes. Actual secured transport, durable
+application state, distributed membership operation completion, external
+history checking, disk fault qualification, and the long-running acceptance
+campaign remain mandatory later gates.
 
 | Alternative | Value | Reason not to select it automatically |
 | --- | --- | --- |

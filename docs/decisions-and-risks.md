@@ -1,6 +1,8 @@
 # Decisions and risks
 
-Status: design register, not an approval to implement.
+Status: implementation contract approved on 2026-11-07. Approval is not
+production qualification. The initial consensus safety failure and local
+fork decision are recorded in [consensus](consensus.md).
 
 ## Decision states
 
@@ -10,19 +12,19 @@ explicit owner input before dependent work starts.
 
 | ID | Decision | State | Reason / required resolution |
 | --- | --- | --- | --- |
-| D01 | Private, docs-only repository; no CI | Confirmed | Current delivery constraint; Actions disabled |
+| D01 | Private implementation repository; no CI | Confirmed | Implementation supersedes docs-only restriction; Actions disabled |
 | D02 | SQLite-backed state and non-Raft product consensus | Confirmed | Core requested properties |
 | D03 | Etcqlite working name | Proposed | Matches the chosen concept; legal/package clearance not performed |
 | D04 | Client/API compatibility, not etcd peer compatibility | Proposed | Non-Raft peers cannot transparently join an etcd Raft cluster |
 | D05 | Initial reference etcd v3.7.3 | Proposed, source pinned | Latest release observed on 2026-10-29; older clients qualified separately |
 | D06 | Rust core with Tokio/Tonic and SQLite | Proposed | Avoid a consensus FFI boundary; Porto integrations remain process/API based |
-| D07 | OmniPaxos/Sequence Paxos candidate | Blocked on M0 gates | In-development library; learner, transfer, read and recovery suitability unproven |
+| D07 | Maintained OmniPaxos/Sequence Paxos fork | Owner approved | Upstream snapshot safety failure reproduced and repaired locally; bounded M0 simulations pass, production qualification remains pending |
 | D08 | SQLite protocol storage and application state in one file | Proposed | Clear atomicity/ownership; throughput and flush cost need measurement |
 | D09 | Logged read barriers before optimized reads | Proposed | Simple authority argument; may be a major performance cost |
 | D10 | Three voters, conventional quorum; no degraded automatic writes | Proposed safety contract | Preserve clear partition and durability behavior |
 | D11 | Full 49-RPC inventory plus gateway/tooling qualification | Proposed | Prevent accidental Kubernetes-subset marketing |
 | D12 | Offline fenced first migration | Proposed | Avoid unproven dual-write synchronization |
-| D13 | Optional non-Raft Go/bbolt tooling converter | Blocked on M0 tooling spike | Needed only if faithful snapshot interop cannot otherwise be achieved |
+| D13 | Isolated non-Raft Go/bbolt tooling converter | Selected after M0 spike | Binary buckets survive conversion and pinned etcdutl status/restore; full server migration remains a later gate |
 | D14 | Porto opt-in lifecycle, inspector read-only | Proposed | Reuse existing product boundaries; no direct SQL mutations |
 | D15 | Linux AMD64/ARM64 first; macOS dev next | Proposed | Native storage correctness before additional platform guarantees |
 | D16 | At least 20% primary-workload throughput improvement | Proposed acceptance target | Not a measurement; owner freezes it before implementation |
@@ -67,6 +69,6 @@ For a decision, retain the question, considered alternatives, immutable source
 references, test evidence, cost, failure assumptions, and the owner-approved
 outcome. Update dependent documents before dependent implementation starts.
 
-No new protocol fork, external coordination dependency, scope reduction,
-production readiness claim, default-branch merge, or CI enablement is implied
-by this plan.
+The local OmniPaxos fork has explicit owner approval. No external
+coordination dependency, scope reduction, production readiness claim,
+default-branch merge, or CI enablement is implied.
