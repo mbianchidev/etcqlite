@@ -1,8 +1,9 @@
 # Full implementation plan
 
-Status: design only. **Do not execute these milestones under the current
-request.** The authorized delivery is a private repository of documentation
-with no code and no CI.
+Status: implementation authorized on 2026-11-07. The owner approved the
+proposed contract and a maintained local OmniPaxos fork after a failed
+snapshot-safety spike. CI remains disabled. Milestones are complete only when
+their stated exit evidence exists; code presence alone is not acceptance.
 
 ## Outcome
 
@@ -44,8 +45,9 @@ diagnostics, documentation, and manual tests accompany every milestone.
 
 ## M0: approve the contract and prove the risky interfaces
 
-**Prerequisites:** separate authorization for implementation; owner approval
-of the proposed scope, platform, stack, and performance objective.
+**Prerequisites:** implementation and proposed-contract approval received on
+2026-11-07. See [consensus](consensus.md) for the initial failed gate, authorized
+fix, and reproducible bounded evidence.
 
 | Work package | Deliverable | Exit evidence |
 | --- | --- | --- |
@@ -236,7 +238,7 @@ required.
 
 ## Repository and change discipline
 
-The present repository stays docs-only until implementation is requested.
+The earlier docs-only restriction was superseded by the implementation request.
 No automatic CI or release automation is part of the plan. Future manual
 commands and useful test helpers belong in the authorized implementation
 work, not this delivery.

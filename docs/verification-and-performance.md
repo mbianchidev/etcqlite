@@ -1,7 +1,8 @@
 # Verification and performance plan
 
-Status: future manual acceptance work. No tests, benchmarks, workflows, or
-results are included in this repository.
+Status: manual acceptance contract with bounded M0/M1 tests and synthetic
+reference baselines implemented. See [development](development.md).
+There is no production/performance qualification or CI workflow.
 
 **No CI is authorized.** Run future checks manually in isolated development
 workspaces after implementation is requested. Do not enable Actions or add

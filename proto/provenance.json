@@ -1,0 +1,16 @@
+{
+  "etcd": {
+    "version": "3.7.3",
+    "commit": "0a173d0410a96d01091b484daae81365bbcde57e",
+    "license": "Apache-2.0"
+  },
+  "googleapis": {
+    "commit": "9415ba048aa587b1b2df2b96fc00aa009c831597",
+    "license": "Apache-2.0"
+  },
+  "grpc_gateway": {
+    "version": "2.29.0",
+    "commit": "ba9b55c1c15c84633be18c45463e123f31a5e999",
+    "license": "BSD-3-Clause"
+  }
+}

@@ -1,15 +1,16 @@
 # Requirements and product boundary
 
-Status: proposed implementation contract, written 2026-10-29.
+Status: proposed contract approved for implementation on 2026-11-07.
+Originally written 2026-10-29; readiness labels still require evidence.
 
 ## Confirmed requirements
 
 | ID | Requirement |
 | --- | --- |
-| R01 | Create a private repository containing documentation only |
-| R02 | No application code, generated stubs, dependency manifests, build files, executable helpers, or CI workflows in this delivery |
+| R01 | Keep the repository private |
+| R02 | Implement the proposed contract end to end; this supersedes the initial documentation-only delivery restriction |
 | R03 | Keep GitHub Actions disabled; enabling any CI requires explicit authorization |
-| R04 | Plan an etcd replacement backed by SQLite |
+| R04 | Implement an etcd replacement backed by SQLite |
 | R05 | Integrate with Porto and sql-not-so-lite |
 | R06 | Do not use Raft as the product's consensus protocol |
 | R07 | Investigate a faster alternative without weakening etcd's consistency or durability to manufacture a win |
@@ -29,8 +30,8 @@ The initial reference is etcd **v3.7.3**, commit
 An older supported Kubernetes/client version needs its own qualification
 matrix; compatibility with one version does not prove all versions.
 
-The following are proposed boundaries, not claims that the user explicitly
-excluded them:
+The following proposed boundaries were approved with the implementation
+contract:
 
 - No joining an existing etcd Raft cluster as a peer.
 - No reading or writing an etcd data directory directly as SQLite.
@@ -39,7 +40,7 @@ excluded them:
 - No cross-cluster multi-primary writes, sharding, or geo-active/active mode.
 - No arbitrary remote SQL service in the Etcqlite write path.
 
-These boundaries need approval at milestone M0 before implementation. If
+These boundaries were approved at M0. If
 "drop-in" means literal binary, flag, and peer compatibility, revise the scope
 instead of silently narrowing it.
 
@@ -89,20 +90,20 @@ host-level HA.
 
 ## Performance objective
 
-"Faster than etcd" is an experimental objective. The proposed go/no-go target
+"Faster than etcd" is an experimental objective. The approved go/no-go target
 is at least **20% higher sustainable throughput** on the predeclared primary
 three-node workload, with per-operation p99 latency no worse than the
 reference, equal resource limits, equal durability, and no correctness failures.
 
 The workload and measurement protocol are in
 [verification and performance](verification-and-performance.md). This target
-is proposed, not a result or a physical guarantee. If it fails, do not claim a
-faster algorithm; return to a scope decision.
+is a requirement, not a measured result or a physical guarantee. If it fails,
+do not claim a faster algorithm; return to a scope decision.
 
 ## Delivery boundaries
 
-The current request authorizes the plan, not its execution. Future work in
-Porto and sql-not-so-lite needs explicit assignment to those repositories.
-Future code must use a working branch and draft PR; do not merge or push to
-the default branch without authorization. No CI is part of this plan's
-authorized delivery.
+The implementation request authorizes execution in Etcqlite, including the
+subsequently approved local OmniPaxos fork. Work in Porto and sql-not-so-lite
+still needs explicit assignment to those repositories. Use a working branch
+and draft PR; do not merge or push to the default branch. CI and live
+migration remain outside the authorization.

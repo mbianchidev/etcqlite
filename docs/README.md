@@ -1,12 +1,14 @@
 # Documentation
 
-All implementation details below are planned work, not descriptions of an
-existing server. Repository state: documentation only. Actions: disabled.
+Implementation was authorized on 2026-11-07. The milestone documents remain
+acceptance contracts, not blanket claims of delivered behavior. Actions
+remains disabled. See [development](development.md) for runnable checks.
 
 ## Reading order
 
 | Document | Purpose |
 | --- | --- |
+| [Development](development.md) | Manual build/test commands, pinned tools, and current implementation boundary |
 | [Requirements](requirements.md) | Confirmed requirements, proposed product boundary, non-goals, and success criteria |
 | [Alternatives and positioning](alternatives.md) | Competitor comparison, proposed USP, evidence boundaries, and reuse decisions |
 | [Implementation plan](implementation-plan.md) | Ordered work packages, dependencies, deliverables, and stop/go gates |
@@ -28,6 +30,6 @@ when a decision changes; the requirements and decision register are the
 authoritative scope records. Link every implementation milestone to its
 acceptance evidence rather than treating an unchecked task list as proof.
 
-Implementation, dependency installation, runtime experiments, changes to other
-repositories, and CI enablement require a separate request. Manual checks
-described here are future work, not jobs to add to this repository.
+Implementation, dependency installation, and isolated runtime experiments are
+authorized. Changes to other repositories, live migration, and CI enablement
+still require separate authorization. Checks remain manual.

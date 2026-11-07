@@ -1,7 +1,19 @@
 # SQLite storage and MVCC
 
-Status: proposed logical schema and persistence contract. No SQL schema or
-database has been created.
+Status: deterministic local KV state machine implemented and tested in
+`src/storage/`. The concrete schema is `src/storage/schema.sql`; networking
+and distributed application integration are separate milestones.
+
+The implemented core has explicit private-directory initialization,
+exclusive ownership, binary unsigned identities, metadata/history/result
+checksums, atomic application plus request-result ledger, MVCC generations,
+range/sort/filter/count semantics, pre-mutation nested comparison paths,
+rollback, compaction floors, and durable watch event records.
+
+Reference-derived initial counters are KV revision `1`, compaction boundary
+`-1`, and auth revision `1`. Lease/auth/membership tables are present; their
+client-facing behavior is not implied by the schema. Schema, command and
+snapshot format qualification still follows the gates below.
 
 ## Engine rules
 
