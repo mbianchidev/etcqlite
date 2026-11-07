@@ -1,12 +1,12 @@
 # Development
 
 Implementation is experimental and checks are manual. GitHub Actions remains
-disabled. The current M0 package is a library/spike, not a client-facing etcd
+disabled. The current M0/M1 package is a library/state machine, not a client-facing etcd
 server. Do not deploy it or claim full compatibility or higher throughput.
 
 ## Toolchain and checks
 
-Use Rust/Cargo and Go 1.26 or later. The initial local runs use Rust 1.99.1,
+Use Rust/Cargo 1.99 or later and Go 1.26 or later. The initial local runs use Rust 1.99.1,
 Go 1.27.3, and macOS ARM64. Linux/platform and minimum-toolchain qualification
 are separate gates. Rust dependencies use `Cargo.lock`; Go uses `tools/go.sum`.
 
@@ -26,6 +26,16 @@ revision merely because the package version matches.
 All fixtures are synthetic. Tests own temporary directories and do not
 discover, scan, modify, or stop existing user services.
 
+The storage cases include process exit before destructors, full application
+rollback after injected persistence failure, persisted internal retry
+identity, unsigned IDs, exact request-size and transaction-operation limits,
+nested transaction headers/comparison timing, and compaction/tombstone floors.
+
+Wire definitions are unmodified upstream inputs under `proto/`; immutable
+provenance and licenses accompany them. The generated descriptor inventory
+must contain exactly 49 unique client RPCs. Generated serializer formatting
+gets one scoped Clippy exception instead of edits to generated bindings.
+
 ## Pinned reference tooling
 
 Use checksum-verified etcd, etcdctl, and etcdutl **v3.7.3**, from the
@@ -44,6 +54,27 @@ The M0 case creates an upstream bbolt snapshot with its SHA-256 trailer,
 retained binary history/tombstones, lease/auth records, and storage metadata.
 The pinned tool must report the expected revision, count, and storage version
 and restore into a new isolated directory. It never connects to a live cluster.
+
+The official client baseline can start its own synthetic loopback references:
+
+```sh
+mkdir -p target/reference
+GOBIN="$(pwd)/target/reference" go install github.com/k3s-io/kine@v0.17.5
+ETCQLITE_ETCD=/path/to/verified/etcd \
+ETCQLITE_KINE="$(pwd)/target/reference/kine" \
+go -C tools test -count=1 -v ./conformance
+```
+
+These tests require `lsof` to verify that the child owns its listener before
+requests are sent. They scrub inherited Kine/AWS settings, disable Kine's
+metrics listener, use private temporary data, and stop only their own child
+processes. Skipped reference tests do not count as conformance.
+
+The pinned Kine module is v0.17.5, commit
+`f82bd25164a393b333815f41746ef89de0d5ae20`. Its default build label is
+`dev (HEAD)`, so verify `go version -m` rather than trusting that label.
+The SQLite baseline supports RangeStream, does not expose AuthStatus, and
+returns an unsupported error for HashKV. It is not the full product scope.
 
 ## Offline converter spike
 

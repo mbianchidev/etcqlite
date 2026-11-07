@@ -12,7 +12,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -60,16 +59,7 @@ where
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             PRAGMA trusted_schema = OFF;
-             PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
-             PRAGMA fullfsync = ON;
-             PRAGMA checkpoint_fullfsync = ON;
-             PRAGMA wal_autocheckpoint = 1000;",
-        )?;
+        crate::sqlite::configure(&connection)?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         ensure(version <= 1, "unsupported protocol storage schema version")?;
         connection.execute_batch(

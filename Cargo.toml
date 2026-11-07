@@ -2,17 +2,28 @@
 name = "etcqlite"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 description = "SQLite-backed etcd-compatible storage with non-Raft consensus"
 publish = false
 
 [dependencies]
+base64 = "=0.23.1"
 omnipaxos = { path = "vendor/omnipaxos", default-features = false, features = ["serde"] }
+pbjson = "=0.9.0"
+prost = "=0.14.4"
+prost-types = "=0.14.4"
 rusqlite = { version = "=0.41.1", features = ["bundled", "backup"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 sha2 = "=0.11.1"
 thiserror = "=2.0.21"
+tonic = { version = "=0.14.9", features = ["tls-ring", "gzip"] }
+tonic-prost = "=0.14.9"
+uuid = { version = "=1.29.1", features = ["v4", "serde"] }
+
+[build-dependencies]
+pbjson-build = "=0.9.0"
+tonic-prost-build = "=0.14.9"
 
 [dev-dependencies]
 omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos", rev = "9c772dcce5a9652192f45f67d9d2208b306f3bc9", default-features = false }

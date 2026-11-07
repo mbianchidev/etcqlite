@@ -1,0 +1,18 @@
+{
+  "etcd": {
+    "server": "3.7.3",
+    "client": "3.7.3",
+    "etcdctl": "3.7.3",
+    "etcdutl": "3.7.3",
+    "commit": "0a173d0410a96d01091b484daae81365bbcde57e"
+  },
+  "kine": {
+    "version": "0.17.5",
+    "commit": "f82bd25164a393b333815f41746ef89de0d5ae20",
+    "backend": "sqlite"
+  },
+  "kubernetes": {
+    "version": "1.37.2",
+    "qualification": "pending"
+  }
+}

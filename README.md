@@ -3,8 +3,9 @@
 An experimental etcd v3-compatible store backed by SQLite, with a non-Raft
 clustered mode and integrations with Porto and sql-not-so-lite.
 
-**Private, experimental implementation.** The durable SQLite protocol adapter,
-fault-simulation harness, and offline etcd snapshot converter are runnable.
+**Private, experimental implementation.** The deterministic SQLite state
+machine, durable protocol adapter, fault-simulation harness, and offline etcd
+snapshot converter are runnable.
 The client-facing server is still being implemented. GitHub Actions remains
 disabled. No production, full-compatibility, or performance claim is made.
 

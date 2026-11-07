@@ -1,7 +1,8 @@
 # Alternatives and positioning
 
-Evidence date: 2026-10-29. Etcqlite remains documentation only. Every Etcqlite
+Evidence date: 2026-10-29. Implementation started on 2026-11-07. Every Etcqlite
 capability below is a target, not a delivered feature or benchmark result.
+See [development](development.md) for actual bounded implementation evidence.
 This comparison does not change the [requirements](requirements.md).
 
 ## Proposed unique selling point
