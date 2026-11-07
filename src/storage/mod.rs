@@ -244,6 +244,7 @@ impl Store {
                 "UPDATE node_state SET runtime_epoch = ?1, checksum = ?2 WHERE id = 1",
                 params![epoch, identity_digest(&self.identity, &mode, epoch)?],
             )?;
+            transaction.execute("DELETE FROM compaction_hashes", [])?;
             let member = pb::Member {
                 id: self.identity.member_id,
                 name: self.identity.name.clone(),

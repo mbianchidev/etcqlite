@@ -5,6 +5,7 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use tonic::Code;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -62,7 +63,7 @@ impl Store {
             let (hash, compact_revision) = if let Some(cached) = cached {
                 cached
             } else {
-                if revision != 0 && revision <= self.compact_revision() {
+                if revision != 0 && revision < self.compact_revision() {
                     return Err(RpcError::new(
                         Code::OutOfRange,
                         "etcdserver: mvcc: required revision has been compacted",
@@ -322,6 +323,36 @@ pub(super) fn hash_kv_at(
     compact_revision: i64,
     revision: i64,
 ) -> Result<u32> {
+    hash_with_keep(connection, compact_revision, revision, false)
+}
+
+pub(super) fn compaction_hash(
+    connection: &Connection,
+    compact_revision: i64,
+    revision: i64,
+) -> Result<u32> {
+    hash_with_keep(connection, compact_revision, revision, true)
+}
+
+fn hash_with_keep(
+    connection: &Connection,
+    compact_revision: i64,
+    revision: i64,
+    compacting: bool,
+) -> Result<u32> {
+    let mut statement = connection.prepare(
+        "SELECT main_revision, sub_revision FROM (
+         SELECT main_revision, sub_revision, kind,
+         ROW_NUMBER() OVER(PARTITION BY key ORDER BY main_revision DESC, sub_revision DESC) AS latest
+         FROM mvcc_versions WHERE main_revision <= ?1)
+         WHERE latest = 1 AND (kind = 0 OR (?2 AND main_revision = ?1))",
+    )?;
+    let keep = statement
+        .query_map(params![revision, compacting], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    drop(statement);
     let mut crc = Crc32c::new();
     crc.update(b"key");
     let mut statement = connection.prepare(
@@ -341,6 +372,9 @@ pub(super) fn hash_kv_at(
             return Err(RpcError::corrupt("MVCC hash input checksum mismatch"));
         }
         if main == compact_revision && kind == 1 {
+            continue;
+        }
+        if main <= compact_revision && !keep.is_empty() && !keep.contains(&(main, sub)) {
             continue;
         }
         crc.update(&revision_key(main, sub, kind == 1));

@@ -233,7 +233,7 @@ impl Apply<'_> {
         if revision < 0 {
             return Err(compacted());
         }
-        let hash = super::maintenance::hash_kv_at(
+        let hash = super::maintenance::compaction_hash(
             self.transaction,
             self.metadata.compacted_revision,
             revision,

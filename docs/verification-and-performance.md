@@ -4,6 +4,41 @@ Status: manual acceptance contract with bounded M0/M1 tests and synthetic
 reference baselines implemented. See [development](development.md).
 There is no production/performance qualification or CI workflow.
 
+## Current bounded qualification
+
+The installed candidate passes official Go client KV/watch/transaction and
+session/mutex/election workflows. A pinned etcd differential compares HashKV
+history, repeated compaction and retained-floor behavior without normalizing
+away hashes or revision boundaries. That differential found and fixed the
+reference's revision-specific keep-set rules; compaction hashes remain a runtime
+cache and are cleared on restart, matching the pinned reference.
+
+`tools/conformance/kubernetes_test.go` constructs the real Kubernetes v1.37.2
+etcd3 storage adapter and reuses upstream storage assertions for get, create,
+conditional/unconditional delete, paging/prefix lists, conflicting updates, TTL
+and key schema. It does not run a complete kube-apiserver/provider qualification.
+The Go test graph includes upstream reference-server dependencies; the product
+and snapshot converter do not use Raft.
+
+```sh
+ETCQLITE_SERVER=/path/to/installed/etcqlite \
+ETCQLITE_ETCD=/path/to/verified/etcd-v3.7.3 \
+go -C tools test -count=1 ./conformance
+```
+
+Reference startup can produce transient client retry logs; negative reference
+cases deliberately produce duplicate-key/root-precondition errors. Kubernetes
+watch cleanup can log context cancellation. These are recorded observations,
+not permission to suppress unexplained failures.
+
+The owner authorized three new isolated Linux VMs for qualification, each
+4 vCPU/8 GiB with an independent 30-GiB local ext4 disk. The instances use a
+checksum-pinned Ubuntu 24.04 ARM64 image, native VZ virtualization, no host/home
+mounts, no forwarded SSH agent or proxy credentials, and only loopback client
+forwarding. They share one physical host and must not be described as host-level
+HA. Primary throughput, long campaigns and recovery results remain unqualified
+until their actual evidence exists.
+
 **No CI is authorized.** Run future checks manually in isolated development
 workspaces after implementation is requested. Do not enable Actions or add
 workflows merely because this document describes repeatable checks.
