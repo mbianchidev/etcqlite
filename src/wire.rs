@@ -19,4 +19,7 @@ pub const DESCRIPTORS: &[u8] = tonic::include_file_descriptor_set!("api");
 pub const ETCD_API_VERSION: &str = "3.7.3";
 pub const ETCD_SOURCE_COMMIT: &str = "0a173d0410a96d01091b484daae81365bbcde57e";
 pub const BUILD_SHA: &str = env!("ETCQLITE_BUILD_SHA");
+pub const BUILD_DIRTY: bool = matches!(env!("ETCQLITE_BUILD_DIRTY").as_bytes(), b"true");
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+mod json;
+pub use json::protobuf_json;

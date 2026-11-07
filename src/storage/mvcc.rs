@@ -112,7 +112,10 @@ impl Apply<'_> {
         })
     }
 
-    fn delete(&mut self, request: &pb::DeleteRangeRequest) -> Result<pb::DeleteRangeResponse> {
+    pub(super) fn delete(
+        &mut self,
+        request: &pb::DeleteRangeRequest,
+    ) -> Result<pb::DeleteRangeResponse> {
         let keys = visible(
             self.transaction,
             &self.metadata,

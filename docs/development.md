@@ -1,8 +1,47 @@
 # Development
 
 Implementation is experimental and checks are manual. GitHub Actions remains
-disabled. The current M0/M1 package is a library/state machine, not a client-facing etcd
-server. Do not deploy it or claim full compatibility or higher throughput.
+disabled. The current package includes a local client-facing prototype. Do not deploy
+it or claim full compatibility, HA, production readiness, or higher throughput.
+
+## Local prototype
+
+```sh
+make build
+target/release/etcqlite init --data-dir ./local-node --name local
+target/release/etcqlite serve --data-dir ./local-node --listen 127.0.0.1:2379
+```
+
+Initialization is explicit and refuses nonempty data directories. Restart
+uses the persisted identity. One dedicated writer owns the node lock and
+SQLite application transactions. Ctrl-C/SIGTERM stops admission and drains
+the owned runtime; user data is never deleted.
+
+The same listener serves native gRPC and protobuf JSON at `/v3/...`, plus
+`/health`, `/livez`, `/readyz`, `/version`, and `/metrics`. Default binding is
+loopback. Non-loopback binding requires `--cert-file`, `--key-file`, and
+`--client-ca-file`; private keys must not be group/world accessible.
+Certificate common names and tokens are authenticated, not caller identity
+headers. Password hashing is bounded and occurs outside deterministic apply;
+plaintext passwords and tokens are not persisted.
+
+The prototype implements the six KV methods, Watch, all five Lease methods,
+all 17 Auth methods, both Lock methods, and all five Election methods.
+RangeStream intentionally has no REST mapping, matching the pinned source.
+Cluster/Maintenance serving and distributed semantic closure remain separate
+pending gates, not successful no-op methods.
+
+`/version` distinguishes the etcd protocol profile from the actual Etcqlite
+version, commit, and dirty-build status. Response headers carry real persisted
+cluster/member IDs and the local execution epoch.
+
+Manual installation defaults to an isolated prefix rather than modifying a
+global tool installation:
+
+```sh
+make install
+target/install/bin/etcqlite --help
+```
 
 ## Toolchain and checks
 

@@ -1,9 +1,14 @@
+pub mod auth;
+pub mod command;
+pub mod lease;
 mod mvcc;
 
 use crate::{
     error::{Result, RpcError},
     wire::{etcdserverpb as pb, mvccpb},
 };
+use auth::Principal;
+use command::{Mutation, Reply};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -104,9 +109,140 @@ pub(crate) struct Apply<'a> {
     pub metadata: Metadata,
     pub sub_revision: i64,
     pub modified: bool,
+    pub principal: Principal,
 }
 
 impl Store {
+    pub fn begin_session(&mut self, client_url: &str) -> Result<u64> {
+        self.ready()?;
+        let result = (|| {
+            let (mode, epoch): (String, i64) = self.connection.query_row(
+                "SELECT mode, runtime_epoch FROM node_state WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if mode != "local" {
+                return Err(RpcError::new(
+                    Code::FailedPrecondition,
+                    "cluster mode requires the replicated runtime",
+                ));
+            }
+            let epoch = epoch
+                .checked_add(1)
+                .ok_or_else(|| RpcError::corrupt("local execution epoch exhausted"))?;
+            let transaction = self
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "UPDATE node_state SET runtime_epoch = ?1, checksum = ?2 WHERE id = 1",
+                params![epoch, identity_digest(&self.identity, &mode, epoch)?],
+            )?;
+            let member = pb::Member {
+                id: self.identity.member_id,
+                name: self.identity.name.clone(),
+                client_ur_ls: vec![client_url.to_owned()],
+                peer_ur_ls: Vec::new(),
+                is_learner: false,
+            };
+            use prost::Message;
+            let bytes = member.encode_to_vec();
+            transaction.execute(
+                "INSERT INTO cluster_members(id, pid, member, checksum) VALUES(?1, 1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET member = excluded.member, checksum = excluded.checksum",
+                params![member.id.to_be_bytes(), bytes, digest(&[&member.id.to_be_bytes(), &bytes])],
+            )?;
+            transaction.commit()?;
+            u64::try_from(epoch).map_err(|_| RpcError::corrupt("negative local epoch"))
+        })();
+        self.guard(result)
+    }
+
+    pub fn advance_barrier(&mut self) -> Result<()> {
+        self.ready()?;
+        let result = (|| {
+            let mut metadata = load_metadata(&self.connection)?;
+            metadata.applied_index = metadata
+                .applied_index
+                .checked_add(1)
+                .ok_or_else(|| RpcError::corrupt("applied index exhausted"))?;
+            signed(metadata.applied_index)?;
+            let transaction = self
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            save_metadata(&transaction, &metadata)?;
+            transaction.commit()?;
+            self.metadata = metadata;
+            Ok(())
+        })();
+        self.guard(result)
+    }
+
+    pub fn members(&self, principal: &Principal) -> Result<pb::MemberListResponse> {
+        self.ready()?;
+        self.guard((|| {
+            auth::require_admin(&self.connection, &self.metadata, principal)?;
+            use prost::Message;
+            let mut statement = self
+                .connection
+                .prepare("SELECT id, member, checksum FROM cluster_members ORDER BY id")?;
+            let mut rows = statement.query([])?;
+            let mut members = Vec::new();
+            while let Some(row) = rows.next()? {
+                let id: Vec<u8> = row.get(0)?;
+                let bytes: Vec<u8> = row.get(1)?;
+                let checksum: Vec<u8> = row.get(2)?;
+                if digest(&[&id, &bytes]) != checksum {
+                    return Err(RpcError::corrupt("member metadata checksum mismatch"));
+                }
+                let member = pb::Member::decode(bytes.as_slice())?;
+                if member.id != decode_id(&id)? {
+                    return Err(RpcError::corrupt("member metadata identity mismatch"));
+                }
+                members.push(member);
+            }
+            Ok(pb::MemberListResponse {
+                header: header(self.metadata.revision),
+                members,
+            })
+        })())
+    }
+
+    pub fn sizes(&self) -> Result<(i64, i64)> {
+        self.ready()?;
+        self.guard((|| {
+            let pages: i64 = self
+                .connection
+                .pragma_query_value(None, "page_count", |row| row.get(0))?;
+            let free: i64 = self
+                .connection
+                .pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+            let size: i64 = self
+                .connection
+                .pragma_query_value(None, "page_size", |row| row.get(0))?;
+            let allocated = pages
+                .checked_mul(size)
+                .ok_or_else(|| RpcError::corrupt("SQLite allocated size overflow"))?;
+            let used = pages
+                .checked_sub(free)
+                .and_then(|pages| pages.checked_mul(size))
+                .ok_or_else(|| RpcError::corrupt("SQLite used size overflow"))?;
+            Ok((allocated, used))
+        })())
+    }
+
+    pub fn defragment(&mut self, principal: &Principal) -> Result<pb::DefragmentResponse> {
+        self.ready()?;
+        let result = (|| {
+            auth::require_admin(&self.connection, &self.metadata, principal)?;
+            self.connection.execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);",
+            )?;
+            Ok(pb::DefragmentResponse {
+                header: header(self.metadata.revision),
+            })
+        })();
+        self.guard(result)
+    }
     pub fn create(directory: impl AsRef<Path>, identity: Identity) -> Result<Self> {
         if identity.cluster_id == 0 || identity.member_id == 0 || identity.name.is_empty() {
             return Err(RpcError::invalid(
@@ -248,6 +384,9 @@ impl Store {
     pub fn applied_index(&self) -> u64 {
         self.metadata.applied_index
     }
+    pub fn auth_revision(&self) -> u64 {
+        self.metadata.auth_revision
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -282,17 +421,38 @@ impl Store {
         request_id: Uuid,
         request: KvRequest,
     ) -> Result<KvReply> {
-        self.ready()?;
-        let result = self.apply_inner(position, request_id, request);
-        self.guard(result)
+        match self.command(
+            position,
+            request_id,
+            Principal::Anonymous,
+            Mutation::Kv(request),
+        )? {
+            Reply::Kv(reply) => Ok(reply),
+            _ => Err(RpcError::corrupt(
+                "KV command returned a different reply kind",
+            )),
+        }
     }
 
-    fn apply_inner(
+    pub fn command(
         &mut self,
         position: u64,
         request_id: Uuid,
-        request: KvRequest,
-    ) -> Result<KvReply> {
+        principal: Principal,
+        request: Mutation,
+    ) -> Result<Reply> {
+        self.ready()?;
+        let result = self.command_inner(position, request_id, principal, request);
+        self.guard(result)
+    }
+
+    fn command_inner(
+        &mut self,
+        position: u64,
+        request_id: Uuid,
+        principal: Principal,
+        request: Mutation,
+    ) -> Result<Reply> {
         let mut metadata = load_metadata(&self.connection)?;
         if position
             != metadata
@@ -305,7 +465,7 @@ impl Store {
             ));
         }
         signed(position)?;
-        let fingerprint = Sha256::digest(serde_json::to_vec(&request)?).to_vec();
+        let fingerprint = request.fingerprint(&principal)?;
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -324,7 +484,7 @@ impl Store {
                     "internal request identity conflict or result checksum mismatch",
                 ));
             }
-            serde_json::from_slice::<Result<KvReply>>(&bytes)?
+            serde_json::from_slice::<Result<Reply>>(&bytes)?
         } else {
             transaction.execute_batch("SAVEPOINT operation")?;
             let mut context = Apply {
@@ -332,8 +492,9 @@ impl Store {
                 metadata: metadata.clone(),
                 sub_revision: 0,
                 modified: false,
+                principal,
             };
-            let result = context.execute(&request);
+            let result = context.execute_command(&request);
             match &result {
                 Ok(_) => {
                     transaction.execute_batch("RELEASE operation")?;

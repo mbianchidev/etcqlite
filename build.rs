@@ -3,6 +3,7 @@ use std::{env, error::Error, fs, path::PathBuf, process::Command};
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-env-changed=ETCQLITE_BUILD_SHA");
+    println!("cargo:rerun-if-env-changed=ETCQLITE_BUILD_DIRTY");
     let output = PathBuf::from(env::var("OUT_DIR")?);
     let descriptor = output.join("api.bin");
     tonic_prost_build::configure()
@@ -44,5 +45,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("ETCQLITE_BUILD_SHA must be a full 40-character commit ID".into());
     }
     println!("cargo:rustc-env=ETCQLITE_BUILD_SHA={sha}");
+    let dirty = match env::var("ETCQLITE_BUILD_DIRTY") {
+        Ok(value) if value == "true" || value == "false" => value,
+        Ok(_) => return Err("ETCQLITE_BUILD_DIRTY must be true or false".into()),
+        Err(env::VarError::NotPresent) => {
+            let result = Command::new("git")
+                .args(["status", "--porcelain", "--untracked-files=normal"])
+                .output()?;
+            if !result.status.success() {
+                return Err(
+                    "git dirty-state lookup failed; set ETCQLITE_BUILD_DIRTY explicitly".into(),
+                );
+            }
+            (!result.stdout.is_empty()).to_string()
+        }
+        Err(error) => return Err(error.into()),
+    };
+    println!("cargo:rustc-env=ETCQLITE_BUILD_DIRTY={dirty}");
     Ok(())
 }
