@@ -37,6 +37,9 @@ func freeAddress(t *testing.T) string {
 func startReference(t *testing.T, kind string) *clientv3.Client {
 	t.Helper()
 	variable := "ETCQLITE_" + strings.ToUpper(kind)
+	if kind == "etcqlite" {
+		variable = "ETCQLITE_SERVER"
+	}
 	binary := os.Getenv(variable)
 	if binary == "" {
 		t.Skipf("set %s to the pinned %s reference executable", variable, kind)
@@ -74,6 +77,13 @@ func startReference(t *testing.T, kind string) *clientv3.Client {
 			"--metrics-bind-address", "0",
 			"--log-format", "json",
 		}
+	case "etcqlite":
+		output, err := exec.Command(binary, "init", "--data-dir", filepath.Join(directory, "node"),
+			"--name", "mock-reference", "--cluster-id", "11", "--member-id", "22").CombinedOutput()
+		if err != nil {
+			t.Fatalf("explicit candidate initialization: %v\n%s", err, output)
+		}
+		args = []string{"serve", "--data-dir", filepath.Join(directory, "node"), "--listen", address}
 	default:
 		t.Fatalf("unknown reference kind %q", kind)
 	}
