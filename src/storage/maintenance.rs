@@ -340,19 +340,24 @@ fn hash_with_keep(
     revision: i64,
     compacting: bool,
 ) -> Result<u32> {
-    let mut statement = connection.prepare(
+    let keep = if compact_revision >= 0 {
+        let mut statement = connection.prepare(
         "SELECT main_revision, sub_revision FROM (
          SELECT main_revision, sub_revision, kind,
          ROW_NUMBER() OVER(PARTITION BY key ORDER BY main_revision DESC, sub_revision DESC) AS latest
          FROM mvcc_versions WHERE main_revision <= ?1)
          WHERE latest = 1 AND (kind = 0 OR (?2 AND main_revision = ?1))",
     )?;
-    let keep = statement
-        .query_map(params![revision, compacting], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-        })?
-        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-    drop(statement);
+        let keep = statement
+            .query_map(params![revision, compacting], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        drop(statement);
+        keep
+    } else {
+        BTreeSet::new()
+    };
     let mut crc = Crc32c::new();
     crc.update(b"key");
     let mut statement = connection.prepare(
@@ -387,17 +392,30 @@ pub(super) struct Crc32c(u32);
 
 impl Crc32c {
     pub fn new() -> Self {
-        Self(!0)
+        Self(0)
     }
     pub fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u32::from(*byte);
-            for _ in 0..8 {
-                self.0 = (self.0 >> 1) ^ (0x82f6_3b78_u32.wrapping_mul(self.0 & 1));
-            }
-        }
+        self.0 = crc32c::crc32c_append(self.0, bytes);
     }
     pub fn finish(self) -> u32 {
-        !self.0
+        self.0
+    }
+}
+
+#[cfg(test)]
+mod crc_tests {
+    use super::Crc32c;
+
+    #[test]
+    fn castagnoli_known_vector_and_incremental_boundaries_match() {
+        let mut whole = Crc32c::new();
+        whole.update(b"123456789");
+        assert_eq!(whole.finish(), 0xe306_9283);
+        let mut incremental = Crc32c::new();
+        incremental.update(b"1234");
+        incremental.update(b"");
+        incremental.update(b"56789");
+        assert_eq!(incremental.finish(), 0xe306_9283);
+        assert_eq!(Crc32c::new().finish(), 0);
     }
 }

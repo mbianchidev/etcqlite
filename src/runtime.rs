@@ -315,6 +315,32 @@ impl Runtime {
         Ok((snapshot, header))
     }
 
+    pub async fn maintenance_read<R: Send + 'static>(
+        &self,
+        principal: Principal,
+        function: impl FnOnce(&Store, pb::ResponseHeader) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
+        let permit = self
+            .snapshot_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                RpcError::new(
+                    Code::ResourceExhausted,
+                    "bulk maintenance read is at capacity",
+                )
+            })?;
+        let (reader, header) = self
+            .read(move |store, state| Ok((store.pinned_reader(&principal)?, state.header(store))))
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            function(&reader, header)
+        })
+        .await
+        .map_err(|error| RpcError::corrupt(format!("maintenance reader task: {error}")))?
+    }
+
     pub fn take_outbox(&self) -> Result<Receiver<Outgoing>> {
         self.outbox
             .lock()

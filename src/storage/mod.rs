@@ -542,6 +542,36 @@ impl Store {
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
+
+    pub(crate) fn pinned_reader(&self, principal: &Principal) -> Result<Self> {
+        self.ready()?;
+        self.require_admin(principal)?;
+        self.guard((|| {
+            let connection = Connection::open_with_flags(
+                &self.path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            connection.execute_batch(
+                "PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; BEGIN DEFERRED;",
+            )?;
+            let metadata = load_metadata(&connection)?;
+            if metadata.revision != self.revision()
+                || metadata.applied_index != self.applied_index()
+            {
+                return Err(RpcError::corrupt(
+                    "snapshot reader differs from the owned writer frontier",
+                ));
+            }
+            Ok(Self {
+                connection,
+                metadata,
+                identity: self.identity.clone(),
+                path: self.path.clone(),
+                healthy: Arc::clone(&self.healthy),
+                _lock: self._lock.try_clone()?,
+            })
+        })())
+    }
     pub fn revision(&self) -> i64 {
         self.metadata.revision
     }

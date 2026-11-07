@@ -187,10 +187,13 @@ impl pb::maintenance_server::Maintenance for Api {
         let principal = self.checked(&request).await?;
         let response = self
             .runtime
-            .read(move |store, state| {
+            .maintenance_read(principal, move |store, header| {
                 Ok(pb::HashResponse {
-                    header: Some(state.header(store)),
-                    hash: store.backend_hash(&principal, state.epoch)?,
+                    hash: store.backend_hash(
+                        &crate::storage::auth::Principal::Internal,
+                        header.raft_term,
+                    )?,
+                    header: Some(header),
                 })
             })
             .await
@@ -205,9 +208,10 @@ impl pb::maintenance_server::Maintenance for Api {
         let revision = request.into_inner().revision;
         let response = self
             .runtime
-            .read(move |store, state| {
-                let mut response = store.hash_kv(&principal, revision)?;
-                fill_header(&mut response.header, state.header(store));
+            .maintenance_read(principal, move |store, header| {
+                let mut response =
+                    store.hash_kv(&crate::storage::auth::Principal::Internal, revision)?;
+                fill_header(&mut response.header, header);
                 Ok(response)
             })
             .await

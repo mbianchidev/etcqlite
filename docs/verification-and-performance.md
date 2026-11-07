@@ -48,6 +48,15 @@ reclaimable file cache, not equivalent heap growth. Data and failure evidence
 were retained. Subsequent serialization/snapshot changes require a fresh
 same-budget run, not a larger-memory pass or a rewritten success report.
 
+The bounded-transport candidate restarted the preserved three-voter dataset
+without resetting identities or promises: all nodes converged at revision
+37,456 and applied index 144,095. Observed restart RSS stayed below 223 MiB.
+This is a recovery/readiness probe, not a completed primary workload run.
+Large HashKV calls then exposed the bit-at-a-time CRC and owned-writer timeout;
+hash scans now use a pinned read-only WAL view off the writer and accelerated
+Castagnoli CRC with the same reference encoding. Large-tool calls still need
+an appropriate client deadline; the exact primary and recovery gates remain open.
+
 The `tools/qualification` runner seeds synthetic 64-byte keys/1024-byte values
 through durable API transactions, starts fixed prefix watches, and issues exact
 100-operation cycles with the frozen 60/10/20/10 mix. It records exact per-operation

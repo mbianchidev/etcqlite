@@ -62,6 +62,7 @@ pub(crate) struct SnapshotSource {
     applied_index: u64,
     configuration: Option<Configuration>,
     healthy: Arc<AtomicBool>,
+    _lock: File,
 }
 
 impl NativeSnapshot {
@@ -81,32 +82,21 @@ impl Store {
     }
 
     pub(crate) fn snapshot_source(&self, principal: &Principal) -> Result<SnapshotSource> {
-        self.ready()?;
-        self.require_admin(principal)?;
-        let connection = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        connection
-            .execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; BEGIN DEFERRED;")?;
-        let metadata = self.guard(load_metadata(&connection))?;
-        if metadata.revision != self.revision() || metadata.applied_index != self.applied_index() {
-            return self.guard(Err(RpcError::corrupt(
-                "snapshot reader differs from the owned writer frontier",
-            )));
-        }
+        let reader = self.pinned_reader(principal)?;
+        let configuration = reader.cluster_configuration()?;
         Ok(SnapshotSource {
-            connection,
-            directory: self
+            connection: reader.connection,
+            directory: reader
                 .path
                 .parent()
                 .ok_or_else(|| RpcError::invalid("node database has no parent"))?
                 .to_owned(),
-            identity: self.identity.clone(),
-            revision: metadata.revision,
-            applied_index: metadata.applied_index,
-            configuration: self.cluster_configuration()?,
-            healthy: Arc::clone(&self.healthy),
+            identity: reader.identity,
+            revision: reader.metadata.revision,
+            applied_index: reader.metadata.applied_index,
+            configuration,
+            healthy: reader.healthy,
+            _lock: reader._lock,
         })
     }
 }
@@ -798,6 +788,7 @@ mod capture_tests {
             )
             .unwrap();
         let source = store.snapshot_source(&Principal::Internal).unwrap();
+        let reader = store.pinned_reader(&Principal::Internal).unwrap();
         store
             .apply(
                 2,
@@ -813,11 +804,17 @@ mod capture_tests {
         assert_eq!(snapshot.info.revision, 2);
         assert_eq!(snapshot.info.applied_index, 1);
         assert_eq!(store.revision(), 3);
+        let hash = reader.hash_kv(&Principal::Internal, 0).unwrap();
+        assert_eq!(hash.header.unwrap().revision, 2);
         let connection =
             Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let count: i64 = connection
             .query_row("SELECT COUNT(*) FROM current_kvs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+        drop(store);
+        assert!(Store::open(directory.path().join("node")).is_err());
+        drop(reader);
+        assert!(Store::open(directory.path().join("node")).is_ok());
     }
 }

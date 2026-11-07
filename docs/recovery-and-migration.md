@@ -90,6 +90,10 @@ Live native and upstream snapshot RPCs pin a consistent WAL reader under the
 owned writer, then perform backup and validation off that writer. Header and
 peer-configuration metadata use the pinned frontier. Capture concurrency is
 bounded across native endpoints; upstream conversion has a ten-minute deadline.
+Backend Hash and HashKV scans share the bounded pinned-reader admission and do
+not hold up protocol ticks or client mutations. Read views retain a duplicate
+of the owned lock descriptor until completion. For large histories, set an
+explicit client deadline, for example `etcdctl --command-timeout=60s endpoint hashkv`.
 This implementation removes the JSON-history limitation, not the remaining
 large-dataset recovery, RPO/RTO or fault qualification gates.
 
