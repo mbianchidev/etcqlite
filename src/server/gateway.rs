@@ -102,7 +102,7 @@ async fn native(State(api): State<Api>, request: HttpRequest) -> Response {
         let artifact = match path.as_str() {
             "/etcqlite/v1/snapshots" => {
                 if options.include_data { return Err(Status::invalid_argument("include_data applies only to projections; snapshots always contain sensitive full state")); }
-                NativeArtifact::Snapshot(api.runtime.maintenance(move |store, _| store.native_snapshot(&principal)).await.map_err(|error| error.status())?)
+                NativeArtifact::Snapshot(api.runtime.native_snapshot(principal).await.map_err(|error| error.status())?.0)
             }
             "/etcqlite/v1/projections" => NativeArtifact::Projection(api.runtime.maintenance(move |store, _| store.inspection_projection(&principal, options.include_data)).await.map_err(|error| error.status())?),
             _ => return Err(Status::not_found("native resource route is not supported")),

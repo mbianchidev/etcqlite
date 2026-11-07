@@ -22,6 +22,7 @@ message PacketChunk {
   bytes data = 9;
   string bootstrap_digest = 10;
   string incarnation = 11;
+  string encoding = 12;
 }
 
 message PacketReceipt {

@@ -1,6 +1,6 @@
 use etcqlite::{
     cluster::{Command, Configuration, Member},
-    replica::Replica,
+    replica::{ELECTION_TIMEOUT_TICKS, Replica},
     storage::{Identity, KvRequest, Store, auth::Principal, command::Mutation},
     wire::etcdserverpb as pb,
 };
@@ -55,7 +55,7 @@ impl Cluster {
             nodes,
             isolated: BTreeSet::new(),
         };
-        cluster.run(30);
+        cluster.run(3 * ELECTION_TIMEOUT_TICKS as usize);
         cluster
     }
 
@@ -196,7 +196,7 @@ fn real_sqlite_state_application_follows_only_decided_non_raft_commands() {
         .0
         .propose(Command::Barrier { id: Uuid::new_v4() })
         .unwrap();
-    cluster.run(30);
+    cluster.run(3 * ELECTION_TIMEOUT_TICKS as usize);
     assert!(
         cluster.nodes[&leader]
             .1
@@ -213,7 +213,7 @@ fn real_sqlite_state_application_follows_only_decided_non_raft_commands() {
     cluster.run(30);
     assert_eq!(cluster.nodes[&majority].1.revision(), 3);
     cluster.isolated.clear();
-    cluster.run(40);
+    cluster.run(3 * ELECTION_TIMEOUT_TICKS as usize);
     let expected = cluster.nodes[&majority]
         .1
         .range(&pb::RangeRequest {
@@ -232,6 +232,22 @@ fn real_sqlite_state_application_follows_only_decided_non_raft_commands() {
                 })
                 .unwrap(),
             expected
+        );
+        let connection = rusqlite::Connection::open_with_flags(
+            store.path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let compacted: i64 = connection
+            .query_row(
+                "SELECT compacted FROM protocol_state WHERE configuration_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            compacted, 0,
+            "retained command logs must resynchronize without full-history snapshot blobs"
         );
     }
 }

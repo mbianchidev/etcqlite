@@ -559,7 +559,19 @@ fn append<T: Serialize>(
 }
 
 fn state_digest(state: &State) -> Result<Vec<u8>> {
-    Ok(Sha256::digest(serde_json::to_vec(state)?).to_vec())
+    struct Checksum(Sha256);
+    impl std::io::Write for Checksum {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut checksum = Checksum(Sha256::new());
+    serde_json::to_writer(&mut checksum, state)?;
+    Ok(checksum.0.finalize().to_vec())
 }
 
 fn entry_digest(config: u32, index: i64, payload: &[u8]) -> Vec<u8> {

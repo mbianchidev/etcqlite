@@ -17,7 +17,18 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-const maxSnapshotBytes int64 = 512 << 20
+const maxSnapshotBytes int64 = 16 << 30
+const maxManifestBytes int64 = 512 << 20
+const maxRecordBytes = 16 << 20
+
+func knownBucket(name []byte) bool {
+	switch string(name) {
+	case "alarm", "auth", "authRoles", "authUsers", "cluster", "key", "lease", "members", "members_removed", "meta":
+		return true
+	default:
+		return false
+	}
+}
 
 type Manifest struct {
 	Format          uint32   `json:"format"`
@@ -46,9 +57,13 @@ func main() {
 
 func run(args []string) error {
 	if len(args) != 3 {
-		return errors.New("usage: etcqlite-snapshot export <manifest.json> <snapshot.db> | import <snapshot.db> <manifest.json>")
+		return errors.New("usage: etcqlite-snapshot export <manifest.json> <snapshot.db> | import <snapshot.db> <manifest.json> | stage <snapshot.db> <interchange.sqlite> | export-native <native.snapshot> <snapshot.db>")
 	}
 	switch args[0] {
+	case "stage":
+		return stageSnapshot(args[1], args[2])
+	case "export-native":
+		return exportNative(args[1], args[2])
 	case "export":
 		manifest, err := readManifest(args[1])
 		if err != nil {
@@ -76,10 +91,10 @@ func readManifest(path string) (manifest Manifest, result error) {
 	if err != nil {
 		return manifest, err
 	}
-	if info.Size() > maxSnapshotBytes {
-		return manifest, fmt.Errorf("manifest exceeds the %d-byte offline converter limit", maxSnapshotBytes)
+	if info.Size() > maxManifestBytes {
+		return manifest, fmt.Errorf("manifest exceeds the %d-byte JSON converter limit; use disk-backed stage/native conversion", maxManifestBytes)
 	}
-	decoder := json.NewDecoder(io.LimitReader(file, maxSnapshotBytes+1))
+	decoder := json.NewDecoder(io.LimitReader(file, maxManifestBytes+1))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&manifest); err != nil {
 		return manifest, fmt.Errorf("decode manifest: %w", err)
@@ -101,8 +116,8 @@ func validateManifest(manifest Manifest) error {
 	keyBucket, metaBucket := false, false
 	var previousBucket []byte
 	for index, bucket := range manifest.Buckets {
-		if len(bucket.Name) == 0 || (index > 0 && bytes.Compare(previousBucket, bucket.Name) >= 0) {
-			return errors.New("snapshot bucket names must be unique and bytewise sorted")
+		if !knownBucket(bucket.Name) || (index > 0 && bytes.Compare(previousBucket, bucket.Name) >= 0) {
+			return errors.New("snapshot bucket names must be known, unique and bytewise sorted")
 		}
 		previousBucket = bucket.Name
 		keyBucket = keyBucket || bytes.Equal(bucket.Name, []byte("key"))
@@ -233,6 +248,19 @@ func verifyChecksum(path string) (result error) {
 	return nil
 }
 
+func checkSnapshot(transaction *bolt.Tx) error {
+	var failures []error
+	for err := range transaction.Check() {
+		if len(failures) < 10 {
+			failures = append(failures, err)
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("bbolt snapshot integrity: %w", errors.Join(failures...))
+	}
+	return nil
+}
+
 func importSnapshot(path string) (manifest Manifest, result error) {
 	if err := verifyChecksum(path); err != nil {
 		return manifest, err
@@ -244,14 +272,8 @@ func importSnapshot(path string) (manifest Manifest, result error) {
 	defer func() { result = errors.Join(result, database.Close()) }()
 	manifest = Manifest{Format: 1, Reference: "3.7.3", Revision: 1, CompactRevision: -1}
 	err = database.View(func(transaction *bolt.Tx) error {
-		var integrityErrors []error
-		for err := range transaction.Check() {
-			if len(integrityErrors) < 10 {
-				integrityErrors = append(integrityErrors, err)
-			}
-		}
-		if len(integrityErrors) != 0 {
-			return fmt.Errorf("bbolt snapshot integrity check: %w", errors.Join(integrityErrors...))
+		if err := checkSnapshot(transaction); err != nil {
+			return err
 		}
 		return transaction.ForEach(func(name []byte, source *bolt.Bucket) error {
 			bucket := Bucket{Name: bytes.Clone(name)}

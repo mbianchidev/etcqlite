@@ -44,6 +44,7 @@ enum Work {
         configuration_id: u32,
         sender_id: u64,
         message: PeerMessage,
+        admission: Vec<tokio::sync::OwnedSemaphorePermit>,
     },
     Reconnected(u32, u64),
     ReplicaRead(ReplicaReadJob),
@@ -125,6 +126,7 @@ pub struct Runtime {
     pub changes: Arc<Notify>,
     timeout: Duration,
     outbox: Arc<Mutex<Option<Receiver<Outgoing>>>>,
+    snapshot_slots: Arc<tokio::sync::Semaphore>,
 }
 
 pub struct Worker {
@@ -186,6 +188,7 @@ impl Runtime {
                 changes,
                 timeout,
                 outbox: Arc::new(Mutex::new(Some(outbox))),
+                snapshot_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             },
             Worker { sender, thread },
         ))
@@ -286,6 +289,32 @@ impl Runtime {
         self.read(|store, state| Ok(state.header(store))).await
     }
 
+    pub async fn native_snapshot(
+        &self,
+        principal: Principal,
+    ) -> Result<(crate::storage::snapshot::NativeSnapshot, pb::ResponseHeader)> {
+        let permit = self
+            .snapshot_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                RpcError::new(
+                    Code::ResourceExhausted,
+                    "native snapshot capture is at capacity",
+                )
+            })?;
+        let (source, header) = self
+            .read(move |store, state| Ok((store.snapshot_source(&principal)?, state.header(store))))
+            .await?;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            source.capture()
+        })
+        .await
+        .map_err(|error| RpcError::corrupt(format!("native snapshot task: {error}")))??;
+        Ok((snapshot, header))
+    }
+
     pub fn take_outbox(&self) -> Result<Receiver<Outgoing>> {
         self.outbox
             .lock()
@@ -300,10 +329,21 @@ impl Runtime {
         sender_id: u64,
         message: PeerMessage,
     ) -> Result<()> {
+        self.deliver_admitted_peer(configuration_id, sender_id, message, Vec::new())
+    }
+
+    pub(crate) fn deliver_admitted_peer(
+        &self,
+        configuration_id: u32,
+        sender_id: u64,
+        message: PeerMessage,
+        admission: Vec<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<()> {
         self.send(Work::Peer {
             configuration_id,
             sender_id,
             message,
+            admission,
         })
     }
 
@@ -530,7 +570,9 @@ fn run_writer(
                 configuration_id,
                 sender_id,
                 message,
+                admission,
             }) => {
+                let _admission = admission;
                 let replica = replica
                     .as_mut()
                     .ok_or_else(|| RpcError::corrupt("peer packet sent to local mode"))?;

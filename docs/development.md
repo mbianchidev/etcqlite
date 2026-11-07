@@ -189,6 +189,8 @@ returns an unsupported error for HashKV. It is not the full product scope.
 go -C tools build -o ../target/etcqlite-snapshot ./snapshot
 target/etcqlite-snapshot export /path/to/manifest.json /path/to/new-snapshot.db
 target/etcqlite-snapshot import /path/to/snapshot.db /path/to/new-manifest.json
+target/etcqlite-snapshot stage /path/to/snapshot.db /path/to/new-interchange.sqlite
+target/etcqlite-snapshot export-native /path/to/verified-native.snapshot /path/to/new-snapshot.db
 ```
 
 The version-1 manifest preserves complete sorted binary bbolt buckets using
@@ -202,9 +204,14 @@ no-overwrite; files and the parent directory are flushed. Failure removes
 only the operation's staging file, never an existing output or source.
 All manifests and snapshots are sensitive, including their auth records.
 
-The converter retains a 512-MiB file limit and materializes the manifest.
+The JSON converter retains a 512-MiB manifest limit. Native/bbolt/staged files
+use a separate 16-GiB limit and a 16-MiB per-record limit. Disk-backed staging
+and bounded native export avoid materializing historical KV or the live-value
+map. Verify native inputs with `etcqlite snapshot status` before standalone
+conversion. The staged marker/schema and SHA-256 footer remain sensitive and
+must be excluded from generic scanner/CRUD/replication surfaces.
 Native SQLite backup/restore, live upstream snapshot streams, application-state
 import/export, explicit revision/cache policy and post-write reverse translation
-are implemented experimentally. Large-dataset streaming and production recovery
+are implemented experimentally. Measured large-dataset and production recovery
 qualification remain open gates. See [recovery](recovery-and-migration.md) and
 [integrations](integrations.md) for commands, fencing and read-only inspection.

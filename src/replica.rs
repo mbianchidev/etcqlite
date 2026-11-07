@@ -20,6 +20,8 @@ use std::{
 use tonic::Code;
 use uuid::Uuid;
 
+pub const ELECTION_TIMEOUT_TICKS: u64 = 50;
+
 type AppliedReplies = Vec<(Uuid, Result<Option<Reply>>)>;
 
 struct Engine {
@@ -44,8 +46,8 @@ impl Engine {
             },
             server_config: ServerConfig {
                 pid,
-                election_tick_timeout: 10,
-                resend_message_tick_timeout: 10,
+                election_tick_timeout: ELECTION_TIMEOUT_TICKS,
+                resend_message_tick_timeout: 50,
                 batch_size: 1,
                 ..Default::default()
             },

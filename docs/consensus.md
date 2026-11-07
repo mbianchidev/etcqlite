@@ -83,6 +83,28 @@ Current-configuration messages have priority over retired-core traffic. These
 changes avoid a reconfiguration heartbeat feedback loop without weakening
 durability or default read barriers.
 
+The primary Linux run exposed an anonymous-memory OOM during retained-history
+operation. Command snapshots contain the whole historical command vector, so
+automatic snapshot synchronization provided no compaction benefit while creating
+large serialized blobs. The maintained fork now lets this entry type prefer a
+retained raw suffix, without overwriting the receiver's decided prefix.
+Previously compacted prefixes still require their supported snapshot path.
+Protocol metadata hashing streams the unchanged encoding.
+
+Peer JSON is gzip-encoded directly into a bounded spool: up to 64 KiB remains
+inline, with larger packets in private temporary files. Wire packets are capped
+at 256 MiB and expanded JSON at 8 GiB; unsupported encodings, trailing bytes,
+corruption and overflow fail explicitly. Only one bulk inbound packet may be
+decoded/queued through durable protocol handling at a time. Small control packets
+retain separate capacity. Elections/resends use 50 elapsed 20-ms ticks, and
+bulk delivery allows a 60-second deadline. Quorum and durable acknowledgments
+are unchanged. These bounds do not prove a fixed heap ceiling for arbitrary logs;
+the original 4-vCPU/8-GiB Linux resource gate still needs a real rerun.
+
+The native peer namespace now emits `gzip-json-v1` packet encoding. Matching
+candidate binaries are required; old small JSON packets remain decodable, but
+mixed-native-binary rolling operation is not qualified.
+
 `tests/cluster_rpc.rs` exercises secured add/remove, actual learner catch-up and
 forwarding, promotion, incarnation fencing, safe join/restart, leadership transfer,
 and quorum loss. `tests/protocol_simulation.rs` includes the stopped-epoch

@@ -14,10 +14,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Semaphore, oneshot},
 };
-use tokio_stream::{
-    StreamExt,
-    wrappers::{ReceiverStream, TcpListenerStream},
-};
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{
     Code, Request, Response, Status,
     transport::{
@@ -28,8 +25,11 @@ use tonic::{
 use uuid::Uuid;
 
 const CHUNK_BYTES: usize = 1 << 20;
-const MAX_PACKET_BYTES: usize = 2 << 30;
+const MAX_PACKET_BYTES: usize = 256 << 20;
+const MAX_EXPANDED_BYTES: u64 = 8 << 30;
+const INLINE_BYTES: usize = 64 << 10;
 const MAX_CATCHUP_BYTES: usize = 16 << 20;
+const MAX_NATIVE_BYTES: u64 = 16 << 30;
 const OUTBOUND_BUDGET_UNITS: usize = MAX_PACKET_BYTES / 1024;
 
 #[derive(Clone, Debug)]
@@ -55,11 +55,63 @@ struct Service {
     runtime: Runtime,
     snapshot_slots: Arc<Semaphore>,
     packet_slots: Arc<Semaphore>,
+    bulk_slots: Arc<Semaphore>,
 }
 
 struct Outbound {
-    data: Arc<Vec<u8>>,
+    payload: Arc<EncodedMessage>,
     _budget: tokio::sync::OwnedSemaphorePermit,
+}
+
+enum EncodedData {
+    Inline(Vec<u8>),
+    File(tempfile::NamedTempFile),
+}
+
+struct EncodedMessage {
+    data: EncodedData,
+    bytes: u64,
+    checksum: Vec<u8>,
+}
+
+struct Spool {
+    data: EncodedData,
+    bytes: u64,
+    hash: Sha256,
+    exceeded: bool,
+}
+
+impl std::io::Write for Spool {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.bytes + buffer.len() as u64 > MAX_PACKET_BYTES as u64 {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "compressed peer packet exceeds 256 MiB",
+            ));
+        }
+        if let EncodedData::Inline(data) = &self.data
+            && data.len() + buffer.len() > INLINE_BYTES
+        {
+            let mut file = tempfile::NamedTempFile::new()?;
+            file.write_all(data)?;
+            self.data = EncodedData::File(file);
+        }
+        match &mut self.data {
+            EncodedData::Inline(data) => data.extend_from_slice(buffer),
+            EncodedData::File(file) => file.write_all(buffer)?,
+        }
+        self.bytes += buffer.len() as u64;
+        self.hash.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.data {
+            EncodedData::Inline(_) => Ok(()),
+            EncodedData::File(file) => file.flush(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -67,6 +119,69 @@ struct Credentials {
     identity: Identity,
     ca: Vec<u8>,
     incarnation: String,
+}
+
+fn spool_message(message: PeerMessage) -> Result<EncodedMessage> {
+    let spool = Spool {
+        data: EncodedData::Inline(Vec::new()),
+        bytes: 0,
+        hash: Sha256::new(),
+        exceeded: false,
+    };
+    let mut encoder = flate2::write::GzEncoder::new(spool, flate2::Compression::fast());
+    if let Err(error) = serde_json::to_writer(&mut encoder, &message) {
+        if encoder.get_ref().exceeded {
+            return Err(RpcError::new(
+                Code::ResourceExhausted,
+                "compressed peer packet exceeds 256 MiB",
+            ));
+        }
+        return Err(error.into());
+    }
+    if let Err(error) = encoder.try_finish() {
+        if encoder.get_ref().exceeded {
+            return Err(RpcError::new(
+                Code::ResourceExhausted,
+                "compressed peer packet exceeds 256 MiB",
+            ));
+        }
+        return Err(error.into());
+    }
+    let spool = encoder.finish()?;
+    Ok(EncodedMessage {
+        data: spool.data,
+        bytes: spool.bytes,
+        checksum: spool.hash.finalize().to_vec(),
+    })
+}
+
+fn decode_message(data: &[u8], encoding: &str) -> Result<PeerMessage> {
+    use std::io::Read;
+    match encoding {
+        "gzip-json-v1" => {
+            let mut decoder = flate2::bufread::GzDecoder::new(std::io::Cursor::new(data));
+            let mut bounded = (&mut decoder).take(MAX_EXPANDED_BYTES + 1);
+            let message = serde_json::from_reader(&mut bounded)
+                .map_err(|error| RpcError::corrupt(format!("compressed peer payload: {error}")))?;
+            if bounded.limit() == 0 {
+                return Err(RpcError::new(
+                    Code::ResourceExhausted,
+                    "expanded peer packet exceeds 8 GiB",
+                ));
+            }
+            if decoder.get_ref().position() != data.len() as u64 {
+                return Err(RpcError::invalid(
+                    "compressed peer packet contains trailing data",
+                ));
+            }
+            Ok(message)
+        }
+        "" if data.len() <= MAX_CATCHUP_BYTES => serde_json::from_slice(data)
+            .map_err(|error| RpcError::corrupt(format!("legacy peer payload: {error}"))),
+        _ => Err(RpcError::invalid(
+            "unsupported peer encoding or legacy transfer limit",
+        )),
+    }
 }
 
 pub async fn start(
@@ -107,7 +222,8 @@ pub async fn start(
         member_id,
         runtime: runtime.clone(),
         snapshot_slots: Arc::new(Semaphore::new(2)),
-        packet_slots: Arc::new(Semaphore::new(4)),
+        packet_slots: Arc::new(Semaphore::new(16)),
+        bulk_slots: Arc::new(Semaphore::new(1)),
     };
     let (stop, stopped) = oneshot::channel();
     let server = Server::builder()
@@ -167,15 +283,18 @@ pub async fn start(
                 )));
                 sender
             });
-            let data = serde_json::to_vec(&packet.message)?;
-            if data.len() > MAX_PACKET_BYTES {
-                tracing::error!(
-                    bytes = data.len(),
-                    "protocol packet exceeds the configured transfer limit"
-                );
-                continue;
-            }
-            let units = u32::try_from(data.len().div_ceil(1024).max(1))
+            let spool = match tokio::task::spawn_blocking(move || spool_message(packet.message))
+                .await
+                .map_err(|error| RpcError::corrupt(format!("peer spool task: {error}")))?
+            {
+                Ok(spool) => spool,
+                Err(error) if error.status().code() == Code::ResourceExhausted => {
+                    tracing::error!(peer_id = packet.receiver, error = %error, "peer packet cannot be transferred");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let units = u32::try_from(spool.bytes.div_ceil(1024).max(1))
                 .map_err(|_| RpcError::corrupt("peer budget exceeds supported range"))?;
             let permit = match budget.clone().try_acquire_many_owned(units) {
                 Ok(permit) => permit,
@@ -186,7 +305,7 @@ pub async fn start(
             };
             if sender
                 .try_send(Outbound {
-                    data: Arc::new(data),
+                    payload: Arc::new(spool),
                     _budget: permit,
                 })
                 .is_err()
@@ -305,7 +424,7 @@ async fn relay(
                 )
             })?
             .connect_timeout(Duration::from_secs(1))
-            .timeout(Duration::from_secs(2));
+            .timeout(Duration::from_secs(60));
         clients.push(pb::peer_client::PeerClient::new(endpoint.connect_lazy()));
     }
     let mut disconnected = false;
@@ -313,30 +432,66 @@ async fn relay(
         let mut delivered = false;
         for client in &mut clients {
             let id = Uuid::new_v4();
-            let checksum = Sha256::digest(outbound.data.as_slice()).to_vec();
-            let data = Arc::clone(&outbound.data);
-            let size = data.len();
+            let checksum = outbound.payload.checksum.clone();
+            let payload = Arc::clone(&outbound.payload);
+            let size = payload.bytes;
             let cluster_id = configuration.cluster_id;
             let configuration_id = configuration.configuration_id;
             let bootstrap_digest = configuration.bootstrap_digest.clone().unwrap_or_default();
             let incarnation = credentials.incarnation.clone();
             let target_id = target.id;
-            let chunks = tokio_stream::iter((0..size).step_by(CHUNK_BYTES)).map(move |offset| {
-                pb::PacketChunk {
-                    cluster_id,
-                    configuration_id,
-                    sender_id: member_id,
-                    receiver_id: target_id,
-                    message_id: id.as_bytes().to_vec(),
-                    total_bytes: size as u64,
-                    offset: offset as u64,
-                    checksum: checksum.clone(),
-                    data: data[offset..(offset + CHUNK_BYTES).min(size)].to_vec(),
-                    bootstrap_digest: bootstrap_digest.clone(),
-                    incarnation: incarnation.clone(),
+            let mut input = match &payload.data {
+                EncodedData::Inline(_) => None,
+                EncodedData::File(file) => Some(tokio::fs::File::open(file.path()).await?),
+            };
+            let (chunks, stream) = tokio::sync::mpsc::channel(2);
+            let sending = tokio::spawn(async move {
+                let mut offset = 0;
+                while offset < size {
+                    let mut data =
+                        vec![
+                            0;
+                            usize::try_from((size - offset).min(CHUNK_BYTES as u64))
+                                .map_err(|_| RpcError::corrupt("peer chunk size overflow"))?
+                        ];
+                    match (&payload.data, &mut input) {
+                        (EncodedData::Inline(bytes), _) => {
+                            let start = offset as usize;
+                            let count = data.len();
+                            data.copy_from_slice(&bytes[start..start + count]);
+                        }
+                        (EncodedData::File(_), Some(input)) => {
+                            input.read_exact(&mut data).await?;
+                        }
+                        _ => return Err(RpcError::corrupt("peer spool reader is unavailable")),
+                    }
+                    let count = data.len() as u64;
+                    let chunk = pb::PacketChunk {
+                        cluster_id,
+                        configuration_id,
+                        sender_id: member_id,
+                        receiver_id: target_id,
+                        message_id: id.as_bytes().to_vec(),
+                        total_bytes: size,
+                        offset,
+                        checksum: checksum.clone(),
+                        data,
+                        bootstrap_digest: bootstrap_digest.clone(),
+                        incarnation: incarnation.clone(),
+                        encoding: "gzip-json-v1".into(),
+                    };
+                    if chunks.send(chunk).await.is_err() {
+                        return Ok(());
+                    }
+                    offset += count;
                 }
+                Ok::<(), RpcError>(())
             });
-            match client.exchange(chunks).await {
+            let response = client.exchange(ReceiverStream::new(stream)).await;
+            sending
+                .await
+                .map_err(|error| RpcError::corrupt(format!("peer stream task: {error}")))??;
+            match response {
                 Ok(receipt) if receipt.get_ref().message_id == id.as_bytes() => {
                     delivered = true;
                     break;
@@ -451,7 +606,7 @@ impl pb::peer_server::Peer for Service {
         &self,
         request: Request<tonic::Streaming<pb::PacketChunk>>,
     ) -> std::result::Result<Response<pb::PacketReceipt>, Status> {
-        let _permit = self
+        let permit = self
             .packet_slots
             .clone()
             .try_acquire_owned()
@@ -487,6 +642,21 @@ impl pb::peer_server::Peer for Service {
                 "peer transfer metadata is invalid",
             ));
         }
+        if first.encoding != "gzip-json-v1"
+            && !(first.encoding.is_empty() && total <= MAX_CATCHUP_BYTES)
+        {
+            return Err(Status::invalid_argument(
+                "unsupported peer encoding or legacy transfer limit",
+            ));
+        }
+        let mut admission = vec![permit];
+        if total > INLINE_BYTES {
+            admission.push(
+                self.bulk_slots.clone().try_acquire_owned().map_err(|_| {
+                    Status::resource_exhausted("bulk peer transfers are at capacity")
+                })?,
+            );
+        }
         let mut data = Vec::new();
         append_chunk(&mut data, &first, total)?;
         while let Some(chunk) = stream.message().await? {
@@ -496,8 +666,11 @@ impl pb::peer_server::Peer for Service {
         if data.len() != total || Sha256::digest(&data).as_slice() != first.checksum {
             return Err(Status::data_loss("peer transfer is truncated or corrupt"));
         }
-        let message: PeerMessage = serde_json::from_slice(&data)
-            .map_err(|_| Status::data_loss("peer payload cannot be decoded"))?;
+        let encoding = first.encoding.clone();
+        let message = tokio::task::spawn_blocking(move || decode_message(&data, &encoding))
+            .await
+            .map_err(|error| Status::internal(format!("peer decoding task: {error}")))?
+            .map_err(|error| error.status())?;
         let sender = configuration
             .member(first.sender_id)
             .map_err(|error| error.status())?;
@@ -534,7 +707,7 @@ impl pb::peer_server::Peer for Service {
             }
         }
         self.runtime
-            .deliver_peer(first.configuration_id, first.sender_id, message)
+            .deliver_admitted_peer(first.configuration_id, first.sender_id, message, admission)
             .map_err(|error| error.status())?;
         Ok(Response::new(pb::PacketReceipt {
             message_id: first.message_id,
@@ -618,20 +791,14 @@ impl pb::peer_server::Peer for Service {
             .barrier()
             .await
             .map_err(|error| error.status())?;
-        let configuration = self
+        let (snapshot, _) = self
             .runtime
-            .read(|store, _| {
-                store
-                    .cluster_configuration()?
-                    .ok_or_else(|| RpcError::corrupt("native snapshot lost cluster identity"))
-            })
+            .native_snapshot(Principal::Internal)
             .await
             .map_err(|error| error.status())?;
-        let snapshot = self
-            .runtime
-            .maintenance(|store, _| store.native_snapshot(&Principal::Internal))
-            .await
-            .map_err(|error| error.status())?;
+        let configuration = snapshot.configuration.clone().ok_or_else(|| {
+            Status::data_loss("native snapshot lost its captured cluster identity")
+        })?;
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         let member_id = self.member_id;
         tokio::spawn(async move {
@@ -678,6 +845,7 @@ impl pb::peer_server::Peer for Service {
                                 .incarnation
                                 .map(|id| id.to_string())
                                 .unwrap_or_default(),
+                            encoding: "native-snapshot-v1".into(),
                         }))
                         .await
                         .is_err()
@@ -978,7 +1146,7 @@ pub async fn snapshot(
     if first.cluster_id != configuration.cluster_id
         || first.sender_id != source
         || first.receiver_id != requester
-        || first.total_bytes > MAX_PACKET_BYTES as u64
+        || first.total_bytes > MAX_NATIVE_BYTES
         || first.message_id.len() != 16
         || first.checksum.len() != 32
         || first.offset != 0
@@ -1021,7 +1189,11 @@ pub async fn snapshot(
             "native snapshot contains a different authority",
         ));
     }
-    Ok(NativeSnapshot { file, info })
+    Ok(NativeSnapshot {
+        file,
+        info,
+        configuration: None,
+    })
 }
 
 async fn file_digest(path: &std::path::Path) -> Result<Vec<u8>> {
@@ -1072,6 +1244,7 @@ fn validate_chunk(
         || chunk.checksum != first.checksum
         || chunk.bootstrap_digest != first.bootstrap_digest
         || chunk.incarnation != first.incarnation
+        || chunk.encoding != first.encoding
     {
         return Err(Status::permission_denied(
             "peer metadata changed mid-stream",
@@ -1119,4 +1292,93 @@ fn validate_certificate(
 
 fn rpc_error(error: Status) -> RpcError {
     RpcError::new(error.code(), error.message())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        cluster::Command,
+        storage::{KvRequest, command::Mutation},
+        wire::etcdserverpb,
+    };
+    use std::io::Read;
+
+    #[test]
+    fn compressed_protocol_spills_without_materializing_the_json_packet() {
+        for bytes in [64, 2 << 20] {
+            let mut state = 42_u64;
+            let value = (0..bytes)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect();
+            let message = PeerMessage::Proposal(Command::Mutation {
+                id: Uuid::from_u128(42),
+                principal: Principal::Anonymous,
+                request: Mutation::Kv(KvRequest::Put(etcdserverpb::PutRequest {
+                    key: b"mock/transport".to_vec(),
+                    value,
+                    ..Default::default()
+                })),
+            });
+            let expected = serde_json::to_vec(&message).unwrap();
+            let encoded = spool_message(message).unwrap();
+            let compressed = match encoded.data {
+                EncodedData::Inline(data) => {
+                    assert!(bytes < INLINE_BYTES);
+                    assert!(data.len() <= INLINE_BYTES);
+                    data
+                }
+                EncodedData::File(file) => {
+                    assert!(bytes > INLINE_BYTES);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_eq!(
+                            file.as_file().metadata().unwrap().permissions().mode() & 0o777,
+                            0o600
+                        );
+                    }
+                    let mut data = Vec::new();
+                    file.reopen().unwrap().read_to_end(&mut data).unwrap();
+                    data
+                }
+            };
+            assert_eq!(encoded.bytes, compressed.len() as u64);
+            assert_eq!(encoded.checksum, Sha256::digest(&compressed).to_vec());
+            let decoded = decode_message(&compressed, "gzip-json-v1").unwrap();
+            assert_eq!(serde_json::to_vec(&decoded).unwrap(), expected);
+            assert!(decode_message(&compressed[..compressed.len() - 1], "gzip-json-v1").is_err());
+            assert!(decode_message(&compressed, "unknown").is_err());
+            let mut trailing = compressed.clone();
+            trailing.push(0);
+            assert!(decode_message(&trailing, "gzip-json-v1").is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_protocol_and_compressed_size_limit_are_explicit() {
+        use std::io::Write;
+        let message = PeerMessage::Proposal(Command::Barrier {
+            id: Uuid::from_u128(1),
+        });
+        let bytes = serde_json::to_vec(&message).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&decode_message(&bytes, "").unwrap()).unwrap(),
+            bytes
+        );
+        let mut spool = Spool {
+            data: EncodedData::Inline(Vec::new()),
+            bytes: MAX_PACKET_BYTES as u64,
+            hash: Sha256::new(),
+            exceeded: false,
+        };
+        assert!(spool.write_all(&[1]).is_err());
+        assert!(spool.exceeded);
+        assert!(matches!(spool.data, EncodedData::Inline(data) if data.is_empty()));
+    }
 }

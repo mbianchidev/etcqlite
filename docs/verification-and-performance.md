@@ -39,6 +39,15 @@ forwarding. They share one physical host and must not be described as host-level
 HA. Primary throughput, long campaigns and recovery results remain unqualified
 until their actual evidence exists.
 
+The first full primary candidate run at `c626c41271683cd383ac8f086a0aa8a67b09d93a`
+failed: the first guest's server was OOM-killed with 7,786,568 KiB anonymous RSS.
+The client run was stopped and no successful primary percentile/throughput
+result was emitted. The two surviving processes later had approximately
+11-13 MiB anonymous RSS; their roughly 6-GiB cgroup accounting was predominantly
+reclaimable file cache, not equivalent heap growth. Data and failure evidence
+were retained. Subsequent serialization/snapshot changes require a fresh
+same-budget run, not a larger-memory pass or a rewritten success report.
+
 The `tools/qualification` runner seeds synthetic 64-byte keys/1024-byte values
 through durable API transactions, starts fixed prefix watches, and issues exact
 100-operation cycles with the frozen 60/10/20/10 mix. It records exact per-operation
@@ -46,6 +55,14 @@ latencies, including p99/p99.9, errors and warmup errors in new mode-0600 JSON
 reports. It refuses a nonempty fixture namespace, HTTP endpoints, unbounded
 workers, or silent latency sampling. Smaller/shorter probes are explicitly
 `primary_workload_shape: false`, never production evidence.
+
+Reports reserve a new private output before contacting the fixture. Setup,
+seeding, warmup and measurement failures retain their phase, seeded mutation
+count, actual elapsed timing and failure text. SIGINT/SIGTERM stops new requests
+and preserves an incomplete report; exact-sample overflow stops the workload
+without publishing truncated percentiles. Only completed runs with the actual
+primary timing can carry the primary-shape flag. This is evidence retention,
+not an external linearizability checker.
 
 ```sh
 GOMAXPROCS=2 go -C tools run ./qualification \

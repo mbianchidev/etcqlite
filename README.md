@@ -8,8 +8,9 @@ Lock/Election helpers, deterministic SQLite state, protocol fault spikes,
 and an offline snapshot converter are runnable. Dynamic non-Raft membership,
 learner bootstrap/promotion, leadership transfer, Maintenance, native recovery,
 reversible application translation, and read-only integration endpoints now
-have bounded synthetic evidence. Cross-project wiring and production/performance
-qualification are still being implemented. GitHub Actions remains
+have bounded synthetic evidence. Opt-in Porto and sql-not-so-lite wiring is
+implemented in approved draft PRs. Production/performance qualification remains
+open, including a failed Linux memory gate. GitHub Actions remains
 disabled. No production, full-compatibility, or performance claim is made.
 
 ## Development and scope
@@ -33,6 +34,7 @@ can be claimed.
 
 Use focused branches and draft pull requests. Keep detailed material in
 `docs/` and keep this README short. Implementation was authorized on
-2026-11-07; CI enablement and changes to integration repositories were not.
+2026-11-07. CI enablement remains unauthorized; integration changes are limited
+to the separately approved repository worktrees.
 
 No project license has been selected.

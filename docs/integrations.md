@@ -1,9 +1,13 @@
 # Porto and sql-not-so-lite integrations
 
-Status: Etcqlite-owned API/inspection contracts are implemented experimentally.
-Actual provider/UI wiring still requires work in the integration repositories.
-This repository does not change
-either project or authorize work in their primary checkouts.
+Status: Etcqlite-owned API/inspection contracts and separately approved
+integration worktrees are implemented experimentally.
+[mbianchidev/porto#191](https://github.com/mbianchidev/porto/pull/191) adds native
+lifecycle and new-k3s selection;
+[mbianchidev/sql-not-so-lite#75](https://github.com/mbianchidev/sql-not-so-lite/pull/75)
+adds opt-in catalog/inspector projections and protected-store exclusion.
+Both remain draft delivery, not production or complete k3s qualification.
+No primary checkout or existing workload is retargeted.
 
 ## Implemented service contract
 
@@ -59,7 +63,7 @@ become Etcqlite's replication mechanism.
 | --- | --- | --- |
 | Etcqlite | Cluster authority, mutations, protocol storage, MVCC, leases, auth, verified snapshots | Porto runtime lifecycle or generic SQL editing |
 | Porto | Opt-in provisioning, node/service lifecycle, logs, resource ownership, endpoints, cluster datastore configuration | Consensus elections or database repair decisions |
-| sql-not-so-lite | Explicitly consented read-only inspection and approved projection/snapshot browsing | Direct writes to internal state or election/failover |
+| sql-not-so-lite | Explicitly consented read-only projection inspection | Native/interchange SQL access, direct writes to internal state or election/failover |
 
 Both integrations are optional. A missing or stopped integration cannot
 corrupt state or prevent a standalone server from meeting its contract.
@@ -71,13 +75,14 @@ Kubernetes storage. Preserve current clusters and defaults.
 
 The desired lifecycle contract includes:
 
-- Pinned, checksum-verified executable acquisition after explicit enablement.
+- Separately installed matching `etcqlite` and `etcqlite-snapshot` binaries;
+  no automatic download.
 - Separate data directories and identities for each managed cluster/node.
 - Start/stop/status and bounded readiness with meaningful failure messages.
 - Client/peer address, certificate, port and storage ownership.
 - Persistent logs and resource accounting in existing Porto surfaces.
-- An explicit datastore selection only when creating or deliberately migrating
-  a cluster; never retarget an existing cluster on discovery.
+- An explicit datastore selection only for selected new k3s clusters; existing
+  cluster retargeting and migration are outside this implementation.
 - A safe native snapshot request before destructive runtime-data operations.
 
 Keep the backing store independent of the Kubernetes cluster that needs it
@@ -93,6 +98,15 @@ is not the host. Require mTLS for non-loopback control-plane traffic. Keep
 SQLite on node-local storage rather than sharing a live WAL file through
 host/guest or multi-host filesystem mounts.
 
+The approved implementation uses explicit standalone/three-member host-local
+instances, a separate per-cluster mTLS CA, persisted PID/birth/executable
+ownership proofs, and `node.lock`-protected offline retention. Native processes
+survive Porto daemon exit. A bounded probe from an owned qualification guest
+verified `host.lima.internal` readiness and exact discovery identities over mTLS;
+it did not change a qualification node, port, service, mount or VM setting.
+The native lifecycle profile is macOS/Linux only. One host-local quorum is not
+host-level HA, and a readiness probe is not a full k3s-cluster drill.
+
 ## sql-not-so-lite work package
 
 The default integration is a consented, read-only diagnostic projection or
@@ -107,6 +121,15 @@ Secrets and application credentials can live in the datastore.
 Do not expose password hashes, tokens, credential-bearing command payloads,
 or peer secrets through the default projection. Do not register Etcqlite's
 internal file as an ordinary writable managed database.
+
+The approved inspector integration is disabled by default, pins the identity
+ETag, and stores strictly validated immutable projections in a private cache.
+Metadata consent is separate from process-local raw-KV consent, which is revoked
+on metadata refresh, removal, shutdown and restart. Shared scanner/managed/
+CRUD/replication/recovery guards exclude native `node_state`/`app_state`,
+inspection `projection_metadata`, and sensitive format-2 `interchange_meta`
+schemas even when renamed or manually cataloged; entry rows need not be read to
+recognize protected artifacts.
 
 Direct SQL updates would bypass the replicated log, MVCC revisions, lease
 indexes, and watches. If editing key/value data is ever offered, it must call
@@ -148,6 +171,6 @@ Discovery alone never authorizes installation, startup, mutation, or restore.
 | Porto restarts | Reconcile existing owned processes; do not start a duplicate node |
 | Local three-node demo | Clearly labeled one-host experimentation, not host-level HA |
 
-Work in Porto and sql-not-so-lite must use their own focused branches and
-draft PRs after separate authorization. No cross-repository PR is created
-as part of this documentation delivery.
+Work in Porto and sql-not-so-lite uses their own separately authorized focused
+branches and draft PRs. Merge, existing-workload migration and CI enablement in
+Etcqlite remain unauthorized.

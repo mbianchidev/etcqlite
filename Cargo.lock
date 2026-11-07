@@ -438,6 +438,7 @@ dependencies = [
  "base64 0.23.1",
  "bcrypt",
  "clap",
+ "flate2",
  "omnipaxos",
  "omnipaxos_storage",
  "pbjson",

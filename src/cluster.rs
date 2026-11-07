@@ -217,6 +217,10 @@ impl Snapshot<Command> for CommandSnapshot {
     fn use_snapshots() -> bool {
         true
     }
+
+    fn prefer_snapshot_sync() -> bool {
+        false
+    }
 }
 
 impl Command {

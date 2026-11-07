@@ -162,22 +162,35 @@ async fn leadership_transfer_requires_the_target_to_decide_in_its_new_term() {
         })
         .await
         .unwrap();
-    let mut first = pb::maintenance_client::MaintenanceClient::new(cluster.channel(0).await);
-    let status = first
-        .status(pb::StatusRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    let leader = usize::try_from(status.leader - 1).unwrap();
-    let target = (leader + 1) % 3;
-    let mut current = pb::maintenance_client::MaintenanceClient::new(cluster.channel(leader).await);
-    let response = current
-        .move_leader(pb::MoveLeaderRequest {
-            target_id: target as u64 + 1,
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (target, response) = loop {
+        let mut first = pb::maintenance_client::MaintenanceClient::new(cluster.channel(0).await);
+        let status = first
+            .status(pb::StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let leader = usize::try_from(status.leader - 1).unwrap();
+        let target = (leader + 1) % 3;
+        let mut current =
+            pb::maintenance_client::MaintenanceClient::new(cluster.channel(leader).await);
+        match current
+            .move_leader(pb::MoveLeaderRequest {
+                target_id: target as u64 + 1,
+            })
+            .await
+        {
+            Ok(response) => break (target, response.into_inner()),
+            Err(error)
+                if error.code() == tonic::Code::FailedPrecondition
+                    && error.message() == "etcdserver: not leader"
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("leadership transfer failed: {error}"),
+        }
+    };
     let mut moved = pb::maintenance_client::MaintenanceClient::new(cluster.channel(target).await);
     let status = moved
         .status(pb::StatusRequest {})

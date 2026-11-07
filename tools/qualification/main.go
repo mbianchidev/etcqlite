@@ -11,11 +11,13 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/signal"
 	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -68,6 +70,12 @@ type report struct {
 	WatchShape      string             `json:"watch_shape"`
 	Consistency     string             `json:"consistency"`
 	SampleLimit     int                `json:"latency_sample_limit"`
+	Phase           string             `json:"phase"`
+	Completed       bool               `json:"completed"`
+	Failure         string             `json:"failure,omitempty"`
+	SeededMutations int                `json:"seeded_mutations"`
+	StartedAt       time.Time          `json:"started_at"`
+	EndedAt         time.Time          `json:"ended_at"`
 }
 
 func main() {
@@ -128,6 +136,33 @@ func run(o options) (result error) {
 			return errors.New("qualification never weakens the TLS posture")
 		}
 	}
+	file, err := os.OpenFile(o.output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	r := report{
+		Format: 1, Engine: o.engine, Seed: o.seed, Keys: o.keys, Mutations: o.mutations,
+		KeyBytes: 64, ValueBytes: 1024, Concurrency: o.concurrency, PerOperation: make(map[string]latency),
+		ClientOS: runtime.GOOS, ClientArch: runtime.GOARCH, ClientMaxProcs: runtime.GOMAXPROCS(0),
+		Consistency: "durable-quorum/default-linearizable", SampleLimit: maxLatencySamples,
+		WatchShape: "100 disjoint prefixes covering 10% of 100000 keys in the primary shape",
+		Phase:      "tls", StartedAt: time.Now().UTC(),
+	}
+	var watchErrors atomic.Int64
+	defer func() {
+		r.EndedAt = time.Now().UTC()
+		r.WatchErrors = watchErrors.Load()
+		if result != nil {
+			r.Failure = result.Error()
+		}
+		writeError := json.NewEncoder(file).Encode(r)
+		if writeError == nil {
+			writeError = file.Sync()
+		}
+		result = errors.Join(result, writeError, file.Close())
+	}()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 	certificate, err := tls.LoadX509KeyPair(o.cert, o.key)
 	if err != nil {
 		return err
@@ -149,8 +184,7 @@ func run(o options) (result error) {
 		return err
 	}
 	defer func() { result = errors.Join(result, client.Close()) }()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	r.Phase = "status"
 	versions := make([]string, 0, 3)
 	for _, endpoint := range endpoints {
 		call, done := context.WithTimeout(ctx, 10*time.Second)
@@ -159,6 +193,7 @@ func run(o options) (result error) {
 		if err != nil {
 			return fmt.Errorf("fixture status: %w", err)
 		}
+		r.ServerVersions = versions
 		versions = append(versions, status.Version)
 	}
 	call, done := context.WithTimeout(ctx, 10*time.Second)
@@ -171,6 +206,7 @@ func run(o options) (result error) {
 		return errors.New("fixture namespace is not empty; qualification never deletes or reuses existing data")
 	}
 	value := strings.Repeat("v", 1024)
+	r.Phase = "seed"
 	for start := 0; start < o.mutations; {
 		size := min(128, o.mutations-start)
 		ops := make([]clientv3.Op, size)
@@ -184,13 +220,15 @@ func run(o options) (result error) {
 			return fmt.Errorf("durable seed batch %d: %w", start, err)
 		}
 		start += size
+		r.SeededMutations = start
 	}
-	var watchErrors atomic.Int64
 	var watchWG sync.WaitGroup
+	defer func() { cancel(); watchWG.Wait() }()
 	watchCount := 100
 	if o.keys < 100_000 {
 		watchCount = max(1, o.keys/1_000)
 	}
+	r.Watches = watchCount
 	for index := 0; index < watchCount; index++ {
 		watchWG.Add(1)
 		stream := client.Watch(ctx, fmt.Sprintf("%skey/%03d", namespace, index), clientv3.WithPrefix(), clientv3.WithProgressNotify())
@@ -213,57 +251,44 @@ func run(o options) (result error) {
 			}
 		}()
 	}
-	var warmupErrors int64
+	r.Phase = "warmup"
 	if o.warmup > 0 {
-		if _, warmupFailures, _, err := workload(ctx, client, o, o.warmup, false); err != nil {
+		_, failures, elapsed, err := workload(ctx, client, o, o.warmup, false)
+		r.WarmupErrors, r.WarmupSeconds = failures, elapsed.Seconds()
+		if err != nil {
 			return err
-		} else {
-			warmupErrors = warmupFailures
 		}
 	}
+	r.Phase = "measurement"
 	samples, failures, elapsed, err := workload(ctx, client, o, o.duration, true)
-	if err != nil {
-		return err
-	}
+	r.Errors, r.MeasuredSeconds = failures, elapsed.Seconds()
 	cancel()
 	watchWG.Wait()
-	r := report{
-		Format: 1, Engine: o.engine, Seed: o.seed, Keys: o.keys, Mutations: o.mutations,
-		KeyBytes: 64, ValueBytes: 1024, Concurrency: o.concurrency, Watches: watchCount,
-		WarmupSeconds: o.warmup.Seconds(), MeasuredSeconds: elapsed.Seconds(), Errors: failures,
-		WatchErrors: watchErrors.Load(), PerOperation: make(map[string]latency),
-		WarmupErrors:   warmupErrors,
-		ServerVersions: versions, ClientOS: runtime.GOOS, ClientArch: runtime.GOARCH,
-		ClientMaxProcs: runtime.GOMAXPROCS(0), ProductionClaim: false,
-		Consistency: "durable-quorum/default-linearizable", SampleLimit: maxLatencySamples,
-		WatchShape: "100 disjoint prefixes covering 10% of 100000 keys in the primary shape",
-		PrimaryShape: o.keys == 100_000 && o.mutations == 1_000_000 && watchCount == 100 &&
-			o.warmup >= 5*time.Minute && o.duration >= 15*time.Minute,
-	}
 	var count int
 	for name, values := range samples {
 		count += len(values)
 		r.PerOperation[name] = percentile(values)
 	}
-	r.Throughput = float64(count) / elapsed.Seconds()
-	file, err := os.OpenFile(o.output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if elapsed > 0 {
+		r.Throughput = float64(count) / elapsed.Seconds()
+	}
 	if err != nil {
-		return err
+		return fmt.Errorf("incomplete measurement retained: %w", err)
 	}
-	err = json.NewEncoder(file).Encode(r)
-	if err == nil {
-		err = file.Sync()
-	}
-	if err = errors.Join(err, file.Close()); err != nil {
-		return err
-	}
-	if failures != 0 || r.WatchErrors != 0 || warmupErrors != 0 {
-		return fmt.Errorf("qualification retained failed evidence: request errors=%d, warmup errors=%d, watch errors=%d", failures, warmupErrors, r.WatchErrors)
+	r.Completed = true
+	r.Phase = "complete"
+	r.PrimaryShape = o.keys == 100_000 && o.mutations == 1_000_000 && watchCount == 100 &&
+		r.WarmupSeconds >= (5*time.Minute).Seconds() && r.MeasuredSeconds >= (15*time.Minute).Seconds()
+	if failures != 0 || watchErrors.Load() != 0 || r.WarmupErrors != 0 {
+		return fmt.Errorf("qualification retained failed evidence: request errors=%d, warmup errors=%d, watch errors=%d", failures, r.WarmupErrors, watchErrors.Load())
 	}
 	return nil
 }
 
 func workload(ctx context.Context, client *clientv3.Client, o options, duration time.Duration, record bool) (map[string][]int64, int64, time.Duration, error) {
+	parent := ctx
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	start := time.Now()
 	deadline := start.Add(duration)
 	var mu sync.Mutex
@@ -278,6 +303,9 @@ func workload(ctx context.Context, client *clientv3.Client, o options, duration 
 			random := rand.New(rand.NewSource(o.seed + int64(worker)))
 			for time.Now().Before(deadline) && ctx.Err() == nil {
 				for index := 0; index < 100; index++ {
+					if ctx.Err() != nil {
+						break
+					}
 					name := operation(index)
 					item := random.Intn(o.keys)
 					call, done := context.WithTimeout(ctx, 5*time.Second)
@@ -285,7 +313,11 @@ func workload(ctx context.Context, client *clientv3.Client, o options, duration 
 					var err error
 					switch name {
 					case "range":
-						_, err = client.Get(call, key(item))
+						var response *clientv3.GetResponse
+						response, err = client.Get(call, key(item))
+						if err == nil && (len(response.Kvs) != 1 || string(response.Kvs[0].Value) != strings.Repeat("v", 1024)) {
+							err = errors.New("range did not return its seeded synthetic value")
+						}
 					case "prefix-range":
 						var response *clientv3.GetResponse
 						response, err = client.Get(call, prefix(item), clientv3.WithPrefix())
@@ -295,8 +327,12 @@ func workload(ctx context.Context, client *clientv3.Client, o options, duration 
 					case "put":
 						_, err = client.Put(call, key(item), strings.Repeat("v", 1024))
 					case "cas":
-						_, err = client.Txn(call).If(clientv3.Compare(clientv3.Value(key(item)), "=", strings.Repeat("v", 1024))).
+						var response *clientv3.TxnResponse
+						response, err = client.Txn(call).If(clientv3.Compare(clientv3.Value(key(item)), "=", strings.Repeat("v", 1024))).
 							Then(clientv3.OpPut(key(item), strings.Repeat("v", 1024))).Commit()
+						if err == nil && !response.Succeeded {
+							err = errors.New("CAS rejected the seeded synthetic value")
+						}
 					}
 					done()
 					if err != nil {
@@ -308,6 +344,7 @@ func workload(ctx context.Context, client *clientv3.Client, o options, duration 
 							samples[name] = append(samples[name], time.Since(begin).Nanoseconds())
 						} else {
 							fatal = errors.New("exact latency sample capacity exceeded; no sampled percentile claim is emitted")
+							cancel()
 						}
 						mu.Unlock()
 					}
@@ -316,7 +353,10 @@ func workload(ctx context.Context, client *clientv3.Client, o options, duration 
 		}(worker)
 	}
 	workers.Wait()
-	return samples, failures.Load(), time.Since(start), fatal
+	if fatal != nil {
+		samples = nil
+	}
+	return samples, failures.Load(), time.Since(start), errors.Join(fatal, parent.Err())
 }
 
 func percentile(values []int64) latency {

@@ -12,7 +12,11 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tempfile::NamedTempFile;
@@ -47,6 +51,17 @@ pub struct RestoreInfo {
 pub struct NativeSnapshot {
     pub(crate) file: NamedTempFile,
     pub info: SnapshotInfo,
+    pub(crate) configuration: Option<Configuration>,
+}
+
+pub(crate) struct SnapshotSource {
+    connection: Connection,
+    directory: PathBuf,
+    identity: Identity,
+    revision: i64,
+    applied_index: u64,
+    configuration: Option<Configuration>,
+    healthy: Arc<AtomicBool>,
 }
 
 impl NativeSnapshot {
@@ -62,41 +77,83 @@ impl NativeSnapshot {
 
 impl Store {
     pub fn native_snapshot(&self, principal: &Principal) -> Result<NativeSnapshot> {
+        self.snapshot_source(principal)?.capture()
+    }
+
+    pub(crate) fn snapshot_source(&self, principal: &Principal) -> Result<SnapshotSource> {
+        self.ready()?;
         self.require_admin(principal)?;
-        self.guard(verify_records(&self.connection))?;
-        let file = NamedTempFile::new_in(
-            self.path
-                .parent()
-                .ok_or_else(|| RpcError::invalid("node database has no parent"))?,
+        let connection = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        {
-            let mut destination = Connection::open(file.path())?;
-            Backup::new(&self.connection, &mut destination)?.run_to_completion(
-                128,
-                Duration::from_millis(5),
-                None,
-            )?;
-            destination.execute_batch("PRAGMA journal_mode = DELETE;")?;
-            destination
-                .close()
-                .map_err(|(_, error)| RpcError::from(error))?;
+        connection
+            .execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; BEGIN DEFERRED;")?;
+        let metadata = self.guard(load_metadata(&connection))?;
+        if metadata.revision != self.revision() || metadata.applied_index != self.applied_index() {
+            return self.guard(Err(RpcError::corrupt(
+                "snapshot reader differs from the owned writer frontier",
+            )));
         }
-        append_digest(file.path())?;
-        let info = inspect(file.path())?;
-        if info.cluster_id != self.identity.cluster_id
-            || info.member_id != self.identity.member_id
-            || info.revision != self.revision()
-            || info.applied_index != self.applied_index()
-        {
-            return Err(RpcError::corrupt(
-                "native backup captured inconsistent application identity or frontier",
-            ));
-        }
-        Ok(NativeSnapshot { file, info })
+        Ok(SnapshotSource {
+            connection,
+            directory: self
+                .path
+                .parent()
+                .ok_or_else(|| RpcError::invalid("node database has no parent"))?
+                .to_owned(),
+            identity: self.identity.clone(),
+            revision: metadata.revision,
+            applied_index: metadata.applied_index,
+            configuration: self.cluster_configuration()?,
+            healthy: Arc::clone(&self.healthy),
+        })
     }
 }
 
-pub fn inspect(path: &Path) -> Result<SnapshotInfo> {
+impl SnapshotSource {
+    pub(crate) fn capture(self) -> Result<NativeSnapshot> {
+        let healthy = Arc::clone(&self.healthy);
+        let result = (|| {
+            verify_records(&self.connection)?;
+            let file = NamedTempFile::new_in(&self.directory)?;
+            {
+                let mut destination = Connection::open(file.path())?;
+                Backup::new(&self.connection, &mut destination)?.run_to_completion(
+                    128,
+                    Duration::from_millis(5),
+                    None,
+                )?;
+                destination.execute_batch("PRAGMA journal_mode = DELETE;")?;
+                destination
+                    .close()
+                    .map_err(|(_, error)| RpcError::from(error))?;
+            }
+            append_digest(file.path())?;
+            let info = inspect(file.path())?;
+            if info.cluster_id != self.identity.cluster_id
+                || info.member_id != self.identity.member_id
+                || info.revision != self.revision
+                || info.applied_index != self.applied_index
+            {
+                return Err(RpcError::corrupt(
+                    "native backup captured inconsistent application identity or frontier",
+                ));
+            }
+            Ok(NativeSnapshot {
+                file,
+                info,
+                configuration: self.configuration,
+            })
+        })();
+        if result.as_ref().is_err_and(RpcError::is_storage_fault) {
+            healthy.store(false, Ordering::Release);
+        }
+        result
+    }
+}
+
+pub(crate) fn verified_payload(path: &Path) -> Result<(u64, String)> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(RpcError::invalid(
@@ -126,12 +183,34 @@ pub fn inspect(path: &Path) -> Result<SnapshotInfo> {
             "native snapshot SHA-256 checksum mismatch",
         ));
     }
+    Ok((
+        metadata.len(),
+        trailer.iter().map(|byte| format!("{byte:02x}")).collect(),
+    ))
+}
+
+pub(crate) fn open_artifact(path: &Path) -> Result<Connection> {
+    let absolute = fs::canonicalize(path)?;
+    let encoded = absolute
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect::<String>();
     let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| RpcError::invalid(format!("native snapshot SQLite: {error}")))?;
+        format!("file:{encoded}?immutable=1&mode=ro"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )?;
     connection.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA query_only = ON;")?;
+    Ok(connection)
+}
+
+pub fn inspect(path: &Path) -> Result<SnapshotInfo> {
+    let (bytes, sha256) = verified_payload(path)?;
+    let connection = open_artifact(path)
+        .map_err(|error| RpcError::invalid(format!("native snapshot SQLite: {error}")))?;
     let schema_version: u32 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if schema_version != 1 && schema_version != 2 {
@@ -171,8 +250,8 @@ pub fn inspect(path: &Path) -> Result<SnapshotInfo> {
         compact_revision: state.compacted_revision,
         applied_index: state.applied_index,
         configuration_id: state.configuration_id,
-        bytes: metadata.len(),
-        sha256: trailer.iter().map(|byte| format!("{byte:02x}")).collect(),
+        bytes,
+        sha256,
     })
 }
 
@@ -687,4 +766,58 @@ fn append_digest(path: &Path) -> Result<()> {
     file.write_all(&hash.finalize())?;
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use crate::{storage::KvRequest, wire::etcdserverpb as pb};
+    use uuid::Uuid;
+
+    #[test]
+    fn pinned_snapshot_remains_consistent_while_the_owned_writer_advances() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::create(
+            directory.path().join("node"),
+            Identity {
+                cluster_id: 42,
+                member_id: 1,
+                name: "mock-snapshot".into(),
+            },
+        )
+        .unwrap();
+        store
+            .apply(
+                1,
+                Uuid::from_u128(1),
+                KvRequest::Put(pb::PutRequest {
+                    key: b"mock/pinned".to_vec(),
+                    value: vec![0, 255],
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let source = store.snapshot_source(&Principal::Internal).unwrap();
+        store
+            .apply(
+                2,
+                Uuid::from_u128(2),
+                KvRequest::Put(pb::PutRequest {
+                    key: b"mock/later".to_vec(),
+                    value: vec![128, 0],
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let snapshot = source.capture().unwrap();
+        assert_eq!(snapshot.info.revision, 2);
+        assert_eq!(snapshot.info.applied_index, 1);
+        assert_eq!(store.revision(), 3);
+        let connection =
+            Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM current_kvs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }

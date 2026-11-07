@@ -12,11 +12,11 @@ use crate::{
     wire::{authpb, etcdserverpb as pb, leasepb, mvccpb},
 };
 use prost::Message;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs::File,
     io::{Read, Write},
     path::Path,
@@ -210,11 +210,20 @@ struct EtcdMember<'a> {
 
 impl Store {
     pub fn application_manifest(&self, principal: &Principal, term: u64) -> Result<Manifest> {
+        self.manifest_with_history(principal, term, true)
+    }
+
+    fn manifest_with_history(
+        &self,
+        principal: &Principal,
+        term: u64,
+        include_history: bool,
+    ) -> Result<Manifest> {
         self.require_admin(principal)?;
         self.guard((|| {
             let mut history = Vec::new();
-            let mut statement = self.connection.prepare("SELECT main_revision, sub_revision, key, kind, kv, prev_kv, checksum FROM mvcc_versions ORDER BY main_revision, sub_revision")?;
-            let mut rows = statement.query([])?;
+            let mut statement = self.connection.prepare("SELECT main_revision, sub_revision, key, kind, kv, prev_kv, checksum FROM mvcc_versions WHERE ?1 ORDER BY main_revision, sub_revision")?;
+            let mut rows = statement.query([include_history])?;
             let mut bytes = 0_u64;
             while let Some(row) = rows.next()? {
                 let main: i64 = row.get(0)?; let sub: i64 = row.get(1)?;
@@ -267,6 +276,47 @@ impl Store {
             ]};
             manifest.validate()?;
             Ok(manifest)
+        })())
+    }
+
+    pub fn backend_hash(&self, principal: &Principal, term: u64) -> Result<u32> {
+        self.guard((|| {
+        let manifest = self.manifest_with_history(principal, term, false)?;
+        let mut hash = Crc32c::new();
+        for bucket in manifest.buckets {
+            hash.update(&bucket.name);
+            if bucket.name == b"key" {
+                let mut statement = self.connection.prepare("SELECT main_revision,sub_revision,key,kind,kv,prev_kv,checksum FROM mvcc_versions ORDER BY main_revision,sub_revision")?;
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    let main: i64 = row.get(0)?;
+                    let sub: i64 = row.get(1)?;
+                    let key: Vec<u8> = row.get(2)?;
+                    let kind: i32 = row.get(3)?;
+                    let value: Vec<u8> = row.get(4)?;
+                    let previous: Option<Vec<u8>> = row.get(5)?;
+                    let checksum: Vec<u8> = row.get(6)?;
+                    if history_digest(main, sub, &key, kind, &value, previous.as_deref())
+                        != checksum
+                    {
+                        return Err(RpcError::corrupt("backend hash history checksum mismatch"));
+                    }
+                    hash.update(&revision_key(main, sub, kind == 1));
+                    hash.update(&value);
+                }
+            } else {
+                for entry in bucket.entries {
+                    if bucket.name == b"meta"
+                        && (entry.key == b"consistent_index" || entry.key == b"term")
+                    {
+                        continue;
+                    }
+                    hash.update(&entry.key);
+                    hash.update(&entry.value);
+                }
+            }
+        }
+        Ok(hash.finish())
         })())
     }
 
@@ -340,6 +390,7 @@ impl Store {
                 }
             }
         }
+        self.connection.execute_batch("PRAGMA temp_store=FILE;")?;
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -416,64 +467,115 @@ impl Store {
                 "enabled imported auth has no root administrator",
             ));
         }
-        let mut current = BTreeMap::<Vec<u8>, mvccpb::KeyValue>::new();
-        for item in manifest.bucket(b"key")? {
-            let (main, sub, tombstone) = decode_revision(&item.key)?;
-            let kv = mvccpb::KeyValue::decode(item.value.as_slice())
-                .map_err(|_| RpcError::invalid("invalid imported KV encoding"))?;
-            if main < 1
-                || main > manifest.revision
-                || kv.key.is_empty()
-                || (!tombstone
-                    && (kv.create_revision < 1
-                        || kv.mod_revision != main
-                        || kv.create_revision > main
-                        || kv.version < 1))
-            {
-                return Err(RpcError::invalid(
-                    "imported KV revision or identity is invalid",
-                ));
-            }
-            let previous = current.get(&kv.key).map(Message::encode_to_vec);
-            transaction.execute("INSERT INTO mvcc_versions(main_revision, sub_revision, key, kind, kv, prev_kv, checksum) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![main, sub, kv.key, i32::from(tombstone), item.value, previous, history_digest(main, sub, &kv.key, i32::from(tombstone), &item.value, previous.as_deref())])?;
-            if tombstone {
-                current.remove(&kv.key);
-            } else {
-                current.insert(kv.key.clone(), kv);
-            }
-        }
-        for kv in current.values() {
-            let bytes = kv.encode_to_vec();
-            transaction.execute("INSERT INTO current_kvs(key, kv, create_revision, mod_revision, version, lease, checksum) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![kv.key, bytes, kv.create_revision, kv.mod_revision, kv.version, if kv.lease == 0 { None } else { Some(kv.lease) }, digest(&[&kv.key, &bytes])])?;
-            if kv.lease != 0 {
-                transaction.execute(
-                    "INSERT INTO lease_keys(lease, key) VALUES(?1, ?2)",
-                    params![kv.lease, kv.key],
-                )?;
-            }
-        }
-        if mark_compacted {
-            transaction.execute("DELETE FROM mvcc_versions WHERE NOT EXISTS (SELECT 1 FROM current_kvs WHERE current_kvs.key = mvcc_versions.key AND current_kvs.mod_revision = main_revision AND kind = 0)", [])?;
-        }
-        let logical_bytes: i64 = transaction.query_row(
-            "SELECT COALESCE((SELECT SUM(length(kv)) FROM current_kvs), 0) + COALESCE((SELECT SUM(length(kv) + COALESCE(length(prev_kv), 0) + 128) FROM mvcc_versions), 0)", [],
-            |row| row.get(0),
+        import_history(
+            &transaction,
+            &mut metadata,
+            manifest.revision,
+            mark_compacted,
+            manifest.bucket(b"key")?.iter().cloned().map(Ok),
         )?;
-        metadata.logical_bytes = u64::try_from(logical_bytes)
-            .map_err(|_| RpcError::invalid("imported storage size is negative"))?;
-        if metadata.logical_bytes > metadata.quota_bytes {
-            return Err(RpcError::new(
-                Code::ResourceExhausted,
-                "imported application exceeds the configured quota",
-            ));
-        }
         save_metadata(&transaction, &metadata)?;
         transaction.commit()?;
         self.metadata = metadata;
         Ok(())
     }
+}
+
+fn import_history(
+    transaction: &rusqlite::Transaction<'_>,
+    metadata: &mut super::Metadata,
+    revision: i64,
+    mark_compacted: bool,
+    records: impl Iterator<Item = Result<BucketEntry>>,
+) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TEMP TABLE import_current(key BLOB PRIMARY KEY,kv BLOB NOT NULL) STRICT;",
+    )?;
+    let mut insert = transaction.prepare(
+        "INSERT INTO mvcc_versions(main_revision, sub_revision, key, kind, kv, prev_kv, checksum) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for item in records {
+        let item = item?;
+        let (main, sub, tombstone) = decode_revision(&item.key)?;
+        let kv = mvccpb::KeyValue::decode(item.value.as_slice())
+            .map_err(|_| RpcError::invalid("invalid imported KV encoding"))?;
+        if main < 1
+            || main > revision
+            || kv.key.is_empty()
+            || (!tombstone
+                && (kv.create_revision < 1
+                    || kv.mod_revision != main
+                    || kv.create_revision > main
+                    || kv.version < 1))
+        {
+            return Err(RpcError::invalid(
+                "imported KV revision or identity is invalid",
+            ));
+        }
+        let previous: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT kv FROM import_current WHERE key=?1",
+                [&kv.key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        insert.execute(params![
+            main,
+            sub,
+            kv.key,
+            i32::from(tombstone),
+            item.value,
+            previous,
+            history_digest(
+                main,
+                sub,
+                &kv.key,
+                i32::from(tombstone),
+                &item.value,
+                previous.as_deref()
+            )
+        ])?;
+        if tombstone {
+            transaction.execute("DELETE FROM import_current WHERE key=?1", [&kv.key])?;
+        } else {
+            transaction.execute(
+                "INSERT INTO import_current(key,kv) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET kv=excluded.kv",
+                params![kv.key, item.value],
+            )?;
+        }
+    }
+    drop(insert);
+    let mut current = transaction.prepare("SELECT kv FROM import_current ORDER BY key")?;
+    let mut rows = current.query([])?;
+    while let Some(row) = rows.next()? {
+        let bytes: Vec<u8> = row.get(0)?;
+        let kv = mvccpb::KeyValue::decode(bytes.as_slice())
+            .map_err(|_| RpcError::corrupt("import staging KV cannot be decoded"))?;
+        transaction.execute("INSERT INTO current_kvs(key, kv, create_revision, mod_revision, version, lease, checksum) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![kv.key, bytes, kv.create_revision, kv.mod_revision, kv.version, if kv.lease == 0 { None } else { Some(kv.lease) }, digest(&[&kv.key, &bytes])])?;
+        if kv.lease != 0 {
+            transaction.execute(
+                "INSERT INTO lease_keys(lease, key) VALUES(?1, ?2)",
+                params![kv.lease, kv.key],
+            )?;
+        }
+    }
+    drop(rows);
+    drop(current);
+    transaction.execute_batch("DROP TABLE import_current;")?;
+    if mark_compacted {
+        transaction.execute("DELETE FROM mvcc_versions WHERE NOT EXISTS (SELECT 1 FROM current_kvs WHERE current_kvs.key = mvcc_versions.key AND current_kvs.mod_revision = main_revision AND kind = 0)", [])?;
+    }
+    let logical: i64 = transaction.query_row("SELECT COALESCE((SELECT SUM(length(kv)) FROM current_kvs),0) + COALESCE((SELECT SUM(length(kv)+COALESCE(length(prev_kv),0)+128) FROM mvcc_versions),0)", [], |row| row.get(0))?;
+    metadata.logical_bytes = u64::try_from(logical)
+        .map_err(|_| RpcError::invalid("imported storage size is negative"))?;
+    if metadata.logical_bytes > metadata.quota_bytes {
+        return Err(RpcError::new(
+            Code::ResourceExhausted,
+            "imported application exceeds the configured quota",
+        ));
+    }
+    Ok(())
 }
 
 fn decode_revision(key: &[u8]) -> Result<(i64, i64, bool)> {
@@ -499,6 +601,98 @@ fn decode_revision(key: &[u8]) -> Result<(i64, i64, bool)> {
     Ok((main, sub, key.len() == 18))
 }
 
+fn validate_disk_schema(source: &rusqlite::Connection) -> Result<()> {
+    type Columns<'a> = &'a [(&'a str, &'a str, i64)];
+    let schema: &[(&str, Columns<'_>)] = &[
+        ("interchange_buckets", &[("name", "BLOB", 1)]),
+        (
+            "interchange_entries",
+            &[
+                ("bucket", "BLOB", 1),
+                ("key", "BLOB", 2),
+                ("value", "BLOB", 0),
+            ],
+        ),
+        (
+            "interchange_meta",
+            &[
+                ("kind", "TEXT", 0),
+                ("format", "INTEGER", 0),
+                ("reference", "TEXT", 0),
+                ("revision", "INTEGER", 0),
+                ("compact_revision", "INTEGER", 0),
+            ],
+        ),
+    ];
+    let mut statement = source.prepare(
+        "SELECT name,type FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if objects.len() != schema.len()
+        || objects
+            .iter()
+            .zip(schema)
+            .any(|((name, kind), (expected, _))| name != expected || kind != "table")
+    {
+        return Err(RpcError::invalid(
+            "interchange must contain only the three fixed tables",
+        ));
+    }
+    for (table, expected) in schema {
+        let strict: bool = source.query_row(
+            "SELECT strict FROM pragma_table_list WHERE schema='main' AND name=?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        let mut statement = source.prepare(&format!("PRAGMA main.table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !strict
+            || columns.len() != expected.len()
+            || columns.iter().zip(*expected).any(
+                |(
+                    (name, kind, required, primary),
+                    (expected_name, expected_type, expected_primary),
+                )| {
+                    name != expected_name
+                        || kind != expected_type
+                        || !required
+                        || primary != expected_primary
+                },
+            )
+        {
+            return Err(RpcError::invalid(
+                "interchange table columns, types or primary keys are invalid",
+            ));
+        }
+    }
+    let count: i64 = source.query_row("SELECT COUNT(*) FROM interchange_meta", [], |row| {
+        row.get(0)
+    })?;
+    let invalid: bool = source.query_row(
+        "SELECT EXISTS(SELECT 1 FROM interchange_entries AS e WHERE length(key)=0 OR length(key)>?1 OR length(value)>?1 OR NOT EXISTS(SELECT 1 FROM interchange_buckets AS b WHERE b.name=e.bucket))",
+        [16 << 20], |row| row.get(0),
+    )?;
+    if count != 1 || invalid {
+        return Err(RpcError::invalid(
+            "interchange requires one metadata record, owned entries and at most 16 MiB per key/value record",
+        ));
+    }
+    Ok(())
+}
+
 pub fn restore(
     input: &Path,
     destination: &Path,
@@ -506,6 +700,53 @@ pub fn restore(
     configuration: Option<&crate::cluster::Configuration>,
     revision_bump: i64,
     mark_compacted: bool,
+) -> Result<super::snapshot::RestoreInfo> {
+    restore_with_quota(
+        input,
+        destination,
+        identity,
+        configuration,
+        revision_bump,
+        mark_compacted,
+        None,
+    )
+}
+
+fn bind_import_configuration(
+    store: &mut Store,
+    configuration: &crate::cluster::Configuration,
+) -> Result<()> {
+    let identity = store.identity().clone();
+    let transaction = store
+        .connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "UPDATE node_state SET mode='cluster',checksum=?1 WHERE id=1",
+        [super::identity_digest(&identity, "cluster", 0)?],
+    )?;
+    let bytes = serde_json::to_vec(configuration)?;
+    transaction.execute(
+        "INSERT INTO cluster_configuration(id,configuration,checksum) VALUES(1,?1,?2)",
+        params![bytes, digest(&[&bytes])],
+    )?;
+    super::snapshot::insert_members(&transaction, configuration)?;
+    super::membership::save_configuration(&transaction, configuration, 0, None)?;
+    let mut metadata = store.metadata.clone();
+    metadata.configuration_id = configuration.configuration_id;
+    save_metadata(&transaction, &metadata)?;
+    transaction.commit()?;
+    store.metadata = metadata;
+    Ok(())
+}
+
+pub fn restore_with_quota(
+    input: &Path,
+    destination: &Path,
+    identity: super::Identity,
+    configuration: Option<&crate::cluster::Configuration>,
+    revision_bump: i64,
+    mark_compacted: bool,
+    quota_bytes: Option<u64>,
 ) -> Result<super::snapshot::RestoreInfo> {
     let source_sha256 = hash_file(input)?;
     let manifest = Manifest::read(input)?;
@@ -545,27 +786,12 @@ pub fn restore(
     let staging = tempfile::tempdir_in(parent)?;
     let node = staging.path().join("node");
     let mut store = Store::create(&node, identity.clone())?;
+    if let Some(quota) = quota_bytes {
+        store.bootstrap_quota(quota)?;
+    }
     store.import_manifest(&manifest, revision_bump, mark_compacted)?;
     if let Some(configuration) = &configuration {
-        let transaction = store
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "UPDATE node_state SET mode = 'cluster', checksum = ?1 WHERE id = 1",
-            [super::identity_digest(&identity, "cluster", 0)?],
-        )?;
-        let bytes = serde_json::to_vec(configuration)?;
-        transaction.execute(
-            "INSERT INTO cluster_configuration(id, configuration, checksum) VALUES(1, ?1, ?2)",
-            params![bytes, digest(&[&bytes])],
-        )?;
-        super::snapshot::insert_members(&transaction, configuration)?;
-        super::membership::save_configuration(&transaction, configuration, 0, None)?;
-        let mut metadata = store.metadata.clone();
-        metadata.configuration_id = configuration.configuration_id;
-        save_metadata(&transaction, &metadata)?;
-        transaction.commit()?;
-        store.metadata = metadata;
+        bind_import_configuration(&mut store, configuration)?;
     }
     let result = super::snapshot::RestoreInfo {
         cluster_id: identity.cluster_id,
@@ -581,6 +807,171 @@ pub fn restore(
         .connection
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;")?;
     drop(store);
+    super::snapshot::publish_node(&node.join("node.db"), destination)?;
+    Ok(result)
+}
+
+pub fn restore_disk(
+    input: &Path,
+    destination: &Path,
+    identity: super::Identity,
+    configuration: Option<&crate::cluster::Configuration>,
+    revision_bump: i64,
+    mark_compacted: bool,
+    quota_bytes: Option<u64>,
+) -> Result<super::snapshot::RestoreInfo> {
+    let (bytes, source_sha256) = super::snapshot::verified_payload(input)?;
+    if bytes > 16 << 30 {
+        return Err(RpcError::new(
+            Code::ResourceExhausted,
+            "disk-backed interchange exceeds the 16-GiB file limit",
+        ));
+    }
+    let source = super::snapshot::open_artifact(input)?;
+    let integrity: String = source.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(RpcError::invalid(format!(
+            "interchange integrity: {integrity}"
+        )));
+    }
+    validate_disk_schema(&source)?;
+    let (kind, format, reference, revision, compact): (String, u32, String, i64, i64) = source
+        .query_row(
+            "SELECT kind,format,reference,revision,compact_revision FROM interchange_meta",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+    if kind != "bbolt-interchange" || format != 2 || reference != "3.7.3" {
+        return Err(RpcError::invalid(
+            "unsupported disk-backed interchange profile",
+        ));
+    }
+    let mut manifest = Manifest {
+        format: 1,
+        reference,
+        revision,
+        compact_revision: compact,
+        buckets: Vec::new(),
+    };
+    let mut buckets = source.prepare("SELECT name FROM interchange_buckets ORDER BY name")?;
+    let names = buckets
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut metadata_bytes = 0_u64;
+    for name in names {
+        let mut entries = Vec::new();
+        if name != b"key" {
+            let mut statement = source.prepare(
+                "SELECT key,value FROM interchange_entries WHERE bucket=?1 ORDER BY key",
+            )?;
+            let mut rows = statement.query([&name])?;
+            while let Some(row) = rows.next()? {
+                let key: Vec<u8> = row.get(0)?;
+                let value: Vec<u8> = row.get(1)?;
+                metadata_bytes = metadata_bytes
+                    .checked_add((key.len() + value.len()) as u64)
+                    .ok_or_else(|| RpcError::invalid("interchange metadata size overflow"))?;
+                if metadata_bytes > MAX_MANIFEST_BYTES / 4 * 3 {
+                    return Err(RpcError::new(
+                        Code::ResourceExhausted,
+                        "interchange auth/administrative metadata exceeds the bounded memory limit",
+                    ));
+                }
+                entries.push(BucketEntry { key, value });
+            }
+        }
+        manifest.buckets.push(Bucket { name, entries });
+    }
+    manifest.validate()?;
+    if std::fs::symlink_metadata(destination).is_ok() {
+        return Err(RpcError::new(
+            Code::AlreadyExists,
+            "import never replaces an existing directory",
+        ));
+    }
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging = tempfile::tempdir_in(parent)?;
+    let node = staging.path().join("node");
+    let mut store = Store::create(&node, identity.clone())?;
+    if let Some(quota) = quota_bytes {
+        store.bootstrap_quota(quota)?;
+    }
+    store.import_manifest(&manifest, revision_bump, mark_compacted)?;
+    {
+        let mut metadata = store.metadata.clone();
+        let transaction = store
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut statement = source
+            .prepare("SELECT key,value FROM interchange_entries WHERE bucket=?1 ORDER BY key")?;
+        let entries = statement.query_map([b"key"], |row| {
+            Ok(BucketEntry {
+                key: row.get(0)?,
+                value: row.get(1)?,
+            })
+        })?;
+        import_history(
+            &transaction,
+            &mut metadata,
+            revision,
+            mark_compacted,
+            entries.map(|entry| entry.map_err(RpcError::from)),
+        )?;
+        save_metadata(&transaction, &metadata)?;
+        transaction.commit()?;
+        store.metadata = metadata;
+    }
+    if let Some(configuration) = configuration {
+        configuration.validate()?;
+        configuration.member(identity.member_id)?;
+        if configuration.cluster_id != identity.cluster_id
+            || configuration
+                .members
+                .iter()
+                .any(|member| member.incarnation.is_some())
+            || configuration
+                .bootstrap_digest
+                .as_ref()
+                .is_some_and(|digest| digest != &source_sha256)
+        {
+            return Err(RpcError::invalid(
+                "disk import requires a fresh configuration matching the verified source digest",
+            ));
+        }
+        let mut configuration = configuration.clone();
+        configuration.bootstrap_digest = Some(source_sha256.clone());
+        bind_import_configuration(&mut store, &configuration)?;
+    }
+    let result = super::snapshot::RestoreInfo {
+        cluster_id: identity.cluster_id,
+        member_id: identity.member_id,
+        revision: store.revision(),
+        compact_revision: store.compact_revision(),
+        applied_index: 0,
+        configuration_id: store.metadata.configuration_id,
+        schema_version: store.schema_version()?,
+        source_sha256,
+    };
+    store
+        .connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+    drop(store);
+    if super::snapshot::verified_payload(input)? != (bytes, result.source_sha256.clone()) {
+        return Err(RpcError::invalid(
+            "source interchange changed while importing",
+        ));
+    }
     super::snapshot::publish_node(&node.join("node.db"), destination)?;
     Ok(result)
 }

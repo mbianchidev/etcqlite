@@ -54,9 +54,44 @@ etcqlite snapshot import --input ./application.json --data-dir ./isolated-etcqli
 Interchange preserves binary revisions/tombstones, current generations, leases,
 password hashes, roles/permissions and auth revision. Active source alarms,
 unsupported records or unsafe fields fail explicitly. Consensus membership and
-tokens are not portable authority. The current converter has a 512-MiB manifest/
-snapshot limit and materializes the interchange; it is not large-dataset
-qualification. Native SQLite snapshots themselves stream without that JSON limit.
+tokens are not portable authority. JSON manifests retain their 512-MiB limit.
+For larger histories, use the disk-backed path rather than materializing a JSON
+manifest:
+
+```sh
+etcqlite snapshot save --data-dir ./fenced-node --output ./native.snapshot
+etcqlite snapshot status --input ./native.snapshot
+etcqlite-snapshot export-native ./native.snapshot ./upstream.db
+etcdutl snapshot status ./upstream.db --write-out=json
+
+etcqlite-snapshot stage ./verified-etcd-snapshot.db ./application.sqlite
+etcqlite snapshot import --input ./application.sqlite --data-dir ./isolated-etcqlite \
+  --fenced-source --quota-bytes 8589934592 \
+  --revision-bump 1000000 --mark-compacted
+```
+
+The native/bbolt/staged converter accepts files up to 16 GiB, with at most
+16 MiB per key or value record. Native-to-bbolt export commits bounded 16-MiB
+batches into an unpublished private file. Staging streams all allowlisted
+buckets into SQLite. Import uses a disk-backed temporary current-key index,
+not an in-memory history or live-value map. Administrative/auth metadata remains
+bounded separately. The configured destination quota still applies.
+
+Staged format 2 has one `interchange_meta` record with
+`kind='bbolt-interchange'`, `format=2`, and `reference='3.7.3'`, plus fixed
+`interchange_buckets` and `interchange_entries` tables. Types, primary keys,
+singleton metadata, bucket ownership, record sizes and the SHA-256 footer
+are validated. Unknown tables/views/triggers, malformed profiles and hidden
+or orphan records fail before publication. `compact_revision=-1` is the valid
+fresh-store sentinel. These files contain sensitive auth and historical KV;
+they are not inspector projections or generic writable SQLite databases.
+
+Live native and upstream snapshot RPCs pin a consistent WAL reader under the
+owned writer, then perform backup and validation off that writer. Header and
+peer-configuration metadata use the pinned frontier. Capture concurrency is
+bounded across native endpoints; upstream conversion has a ten-minute deadline.
+This implementation removes the JSON-history limitation, not the remaining
+large-dataset recovery, RPO/RTO or fault qualification gates.
 
 `--fenced-source` is an operator attestation, not software that fences a remote
 cluster. Before destination writes, retain the unchanged fenced source. After
@@ -81,12 +116,13 @@ directory with its old promises erased. A normal restart uses the same owned
 directory. The tests reject stale pre-join identity reuse and preserve a valid
 same-directory restart.
 
-## Three different artifacts
+## Four different artifacts
 
 | Artifact | Purpose | Must not be confused with |
 | --- | --- | --- |
 | Native Etcqlite snapshot | Recover or bootstrap Etcqlite at a known committed state | A raw copy of the active SQLite main file |
 | Upstream-compatible etcd snapshot | Approved etcd tooling interoperability and reversible migration | A renamed SQLite file |
+| Disk-backed application interchange | Bounded-memory fenced translation of complete application history | A native identity-preserving recovery image or writable inspector database |
 | Read-only inspection projection | Consented sql-not-so-lite troubleshooting | A complete backup or recovery source |
 
 Every native snapshot binds cluster identity, format versions, applied

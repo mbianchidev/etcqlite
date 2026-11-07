@@ -112,6 +112,8 @@ struct RestoreOptions {
     fenced_source: bool,
     #[arg(long)]
     cluster_config: Option<PathBuf>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+    quota_bytes: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -412,7 +414,31 @@ fn run_snapshot(command: SnapshotCommand) -> Result<()> {
             let mut source = std::fs::File::open(&input)?;
             let count = source.read(&mut signature)?;
             let native = count == 16 && signature == *b"SQLite format 3\0";
-            let result = if native {
+            let disk = if native {
+                let connection = rusqlite::Connection::open_with_flags(
+                    &input,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='interchange_meta')", [], |row| row.get::<_, bool>(0))?
+            } else {
+                false
+            };
+            let result = if disk {
+                interchange::restore_disk(
+                    &input,
+                    &options.data_dir,
+                    identity,
+                    configuration.as_ref(),
+                    options.revision_bump,
+                    options.mark_compacted,
+                    options.quota_bytes,
+                )?
+            } else if native {
+                if options.quota_bytes.is_some() {
+                    return Err(RpcError::invalid(
+                        "native snapshots retain their source quota; --quota-bytes applies to application interchange imports",
+                    ));
+                }
                 snapshot::restore(
                     &input,
                     &options.data_dir,
@@ -422,13 +448,14 @@ fn run_snapshot(command: SnapshotCommand) -> Result<()> {
                     options.mark_compacted,
                 )?
             } else {
-                interchange::restore(
+                interchange::restore_with_quota(
                     &input,
                     &options.data_dir,
                     identity,
                     configuration.as_ref(),
                     options.revision_bump,
                     options.mark_compacted,
+                    options.quota_bytes,
                 )?
             };
             println!("{}", serde_json::to_string(&result)?);

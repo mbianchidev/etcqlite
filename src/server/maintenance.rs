@@ -188,10 +188,9 @@ impl pb::maintenance_server::Maintenance for Api {
         let response = self
             .runtime
             .read(move |store, state| {
-                let manifest = store.application_manifest(&principal, state.epoch)?;
                 Ok(pb::HashResponse {
                     header: Some(state.header(store)),
-                    hash: manifest.hash(),
+                    hash: store.backend_hash(&principal, state.epoch)?,
                 })
             })
             .await
@@ -230,14 +229,9 @@ impl pb::maintenance_server::Maintenance for Api {
             .barrier()
             .await
             .map_err(|error| error.status())?;
-        let (manifest, header) = self
+        let (snapshot, header) = self
             .runtime
-            .read(move |store, state| {
-                Ok((
-                    store.application_manifest(&principal, state.epoch)?,
-                    state.header(store),
-                ))
-            })
+            .native_snapshot(principal)
             .await
             .map_err(|error| error.status())?;
         let directory = tempfile::tempdir()
@@ -250,18 +244,14 @@ impl pb::maintenance_server::Maintenance for Api {
                     Status::internal(format!("snapshot staging permissions: {error}"))
                 })?;
         }
-        let manifest_path = directory.path().join("manifest.json");
         let image = directory.path().join("snapshot.db");
-        manifest
-            .write(&manifest_path)
-            .map_err(|error| error.status())?;
         let mut command = tokio::process::Command::new(&self.snapshot_tool);
         command
-            .arg("export")
-            .arg(manifest_path)
+            .arg("export-native")
+            .arg(snapshot.path())
             .arg(&image)
             .kill_on_drop(true);
-        let output = tokio::time::timeout(std::time::Duration::from_secs(60), command.output()).await
+        let output = tokio::time::timeout(std::time::Duration::from_secs(600), command.output()).await
             .map_err(|_| Status::deadline_exceeded("upstream snapshot conversion exceeded its deadline"))?
             .map_err(|error| Status::failed_precondition(format!("snapshot converter is unavailable: {error}; install the companion tool or pass --snapshot-tool")))?;
         if !output.status.success() {
