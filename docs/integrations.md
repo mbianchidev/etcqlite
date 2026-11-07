@@ -1,7 +1,41 @@
 # Porto and sql-not-so-lite integrations
 
-Status: proposed cross-repository contracts. This repository does not change
+Status: Etcqlite-owned API/inspection contracts are implemented experimentally.
+Actual provider/UI wiring still requires work in the integration repositories.
+This repository does not change
 either project or authorize work in their primary checkouts.
+
+## Implemented service contract
+
+An explicitly enabled consumer discovers the owned service through authenticated
+`GET /etcqlite/v1/discovery`. The response distinguishes native snapshots from
+inspection projections, reports real resource/schema/build identity, and returns
+an ETag. Every native artifact request must carry that exact `If-Match`; a changed
+identity returns 412 and missing preconditions return 428.
+
+`POST /etcqlite/v1/snapshots` with `{}` streams a verified native recovery image.
+`POST /etcqlite/v1/projections` with `{}` streams a new, metadata-only SQLite
+projection. Both require admin access and bounded artifact admission. Optional
+raw key/value data requires both `include_data` and `ack_sensitive_data`. Password
+hashes, tokens, protocol commands and peer credentials are never projected.
+
+Download native snapshots into private files and verify them with
+`etcqlite snapshot status`. Open projections read-only; they are never backups
+or writable registrations of the internal `node.db`. Discovery provides no raw
+database path and does not authorize installation, startup or mutation.
+
+An offline operator can use:
+
+```sh
+etcqlite inspect --data-dir ./stopped-node --output ./metadata.sqlite
+etcqlite inspect --data-dir ./stopped-node --output ./consented.sqlite \
+  --include-data --ack-sensitive-data
+```
+
+Projections are published no-overwrite with mode 0400. Native snapshots are mode
+0600. A network consumer must apply equivalent local permissions when saving
+streamed bytes. Disabled/missing integrations make no requests and do no external
+work; the standalone server does not invoke Porto or sql-not-so-lite.
 
 ## Existing behavior
 

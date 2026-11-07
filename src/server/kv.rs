@@ -68,6 +68,16 @@ impl pb::kv_server::Kv for Api {
     ) -> std::result::Result<Response<Self::RangeStreamStream>, Status> {
         let principal = self.checked(&request).await?;
         let mut request = request.into_inner();
+        if self
+            .runtime
+            .read(|store, _| Ok(store.protocol_version() == "3.6.0"))
+            .await
+            .map_err(|error| error.status())?
+        {
+            return Err(Status::unimplemented(
+                "RangeStream requires the 3.7 protocol profile",
+            ));
+        }
         if request.sort_order != 0 && !(request.sort_order == 1 && request.sort_target == 0) {
             return Err(Status::unimplemented(
                 "RangeStream does not support custom sort orders",

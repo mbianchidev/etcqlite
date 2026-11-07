@@ -5,8 +5,10 @@ clustered mode and integrations with Porto and sql-not-so-lite.
 
 **Private, experimental prototype.** Native gRPC/HTTP KV, watches, leases, auth,
 Lock/Election helpers, deterministic SQLite state, protocol fault spikes,
-and an offline snapshot converter are runnable. Static non-Raft quorum serving
-has bounded three-node evidence. Dynamic administration, full recovery and
+and an offline snapshot converter are runnable. Dynamic non-Raft membership,
+learner bootstrap/promotion, leadership transfer, Maintenance, native recovery,
+reversible application translation, and read-only integration endpoints now
+have bounded synthetic evidence. Cross-project wiring and production/performance
 qualification are still being implemented. GitHub Actions remains
 disabled. No production, full-compatibility, or performance claim is made.
 

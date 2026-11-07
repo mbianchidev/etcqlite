@@ -1,6 +1,85 @@
 # Recovery, backup, and migration
 
-Status: planned workflows. Nothing here authorizes a live cutover or restore.
+Status: native backup/restore, verified member join, schema up/down migration and
+both-direction application interchange are implemented experimentally. Nothing
+here authorizes a live cutover or restore. Large-dataset and multi-host recovery
+qualification remain pending.
+
+## Runnable offline operations
+
+Stop the owned server before opening its data directory with offline tools.
+The node lock refuses concurrent writers. All destinations must be new; a
+failed operation never overwrites an existing node or verified artifact.
+
+```sh
+etcqlite snapshot save --data-dir ./node --output ./native.snapshot
+etcqlite snapshot status --input ./native.snapshot
+etcqlite snapshot restore --input ./native.snapshot --data-dir ./restored \
+  --fenced-source --revision-bump 1000000 --mark-compacted
+
+etcqlite migrate --data-dir ./node --target 2 --backup ./before-up.snapshot
+etcqlite migrate --data-dir ./compatible-node --target 1 --backup ./before-down.snapshot
+```
+
+New nodes use SQLite schema 2. Schema 1 remains readable and requires explicit
+migration before dynamic administration. Numbered up/down SQL preserves the
+original MVCC format. Downgrade refuses committed reconfiguration, incarnations,
+multi-endpoint state and administrative log/outcome records an older binary
+cannot interpret. It is not an online mixed-binary upgrade mechanism.
+
+Native snapshots use SQLite's consistent backup API, complete application and
+protocol integrity checks, a SHA-256 trailer, private staging and flushed,
+no-overwrite publication. Restore replays decided-but-unapplied commands, creates
+a new cluster identity, clears nonportable votes/tokens/operational alarms, and
+preserves application history, auth and lease state. The returned `source_sha256`
+identifies the input artifact, not the modified restored database.
+
+For whole-cluster restore, provide a fresh shared `--cluster-config` and explicit
+`--member-id` on each node. Every voter must use the **same verified input artifact**.
+Its fingerprint becomes the configuration's bootstrap digest; peer authentication
+rejects a different initial checkpoint under the same cluster ID. This does not
+turn replicas on one host into host-level HA.
+
+```sh
+etcqlite snapshot export --data-dir ./node --output ./application.json
+etcqlite-snapshot export ./application.json ./upstream.db
+etcdutl snapshot status ./upstream.db --write-out=json
+etcdutl snapshot restore ./upstream.db --data-dir ./isolated-etcd
+
+etcqlite-snapshot import ./verified-etcd-snapshot.db ./application.json
+etcqlite snapshot import --input ./application.json --data-dir ./isolated-etcqlite \
+  --fenced-source --revision-bump 1000000 --mark-compacted
+```
+
+Interchange preserves binary revisions/tombstones, current generations, leases,
+password hashes, roles/permissions and auth revision. Active source alarms,
+unsupported records or unsafe fields fail explicitly. Consensus membership and
+tokens are not portable authority. The current converter has a 512-MiB manifest/
+snapshot limit and materializes the interchange; it is not large-dataset
+qualification. Native SQLite snapshots themselves stream without that JSON limit.
+
+`--fenced-source` is an operator attestation, not software that fences a remote
+cluster. Before destination writes, retain the unchanged fenced source. After
+destination writes, export the destination's new state and reverse-translate it
+into a new isolated authority; never repoint clients to the stale source.
+
+Lease checkpoints are honored on restart; absent checkpoints use the granted-TTL
+extension policy. Tokens must be reacquired. Revision bump/compaction is explicit
+and invalidates old watch caches; it is not a counter reset.
+
+## Joining and replacing a member
+
+Add the new member through the Cluster API, issue its certificate from the trusted
+CA with the required cluster/member SPIFFE URI, and obtain a verified native
+snapshot. `etcqlite join --snapshot ./native.snapshot --data-dir ./new-member
+--member-id <new-id> --name <name>` seeds only decided history and creates a new
+local incarnation. Starting the server commits the identity claim before admission.
+Promotion then verifies actual catch-up.
+
+A lost established voter needs removal and a **new** member ID, not a fresh
+directory with its old promises erased. A normal restart uses the same owned
+directory. The tests reject stale pre-join identity reuse and preserve a valid
+same-directory restart.
 
 ## Three different artifacts
 

@@ -55,6 +55,40 @@ application state, distributed membership operation completion, external
 history checking, disk fault qualification, and the long-running acceptance
 campaign remain mandatory later gates.
 
+## Dynamic runtime evidence
+
+The server now applies membership proposals under the old quorum, commits the
+corresponding StopSign, atomically records the new configuration/base, and
+establishes a barrier under the new quorum before returning ordinary membership
+success. Retired durable cores remain available for late old-configuration
+messages. Member IDs stay tombstoned; bounded process IDs can be reused only in
+a later configuration, whose authenticated envelope prevents cross-epoch votes.
+
+The stopped-configuration restart case found another upstream synchronization
+bug: accepted/decided positions include the StopSign, but data suffix offsets do
+not. The maintained fork now excludes the StopSign from data synchronization
+frontiers. The SQLite adapter separately protects the immutable decided data
+prefix and the decided StopSign. It never fills a missing log position or permits
+replacement of a decided stop marker.
+
+Non-voters persist certified decided prefixes before applying them. A joining
+voter cannot vote until its locally persisted incarnation has been claimed in
+the replicated membership state. Reusing an old pre-join snapshot to reset a
+claimed identity fails; ordinary restart keeps both the incarnation and votes.
+Cloning an established member's entire identity/private storage into concurrent
+instances is outside the supported failure model.
+
+Protocol ticks are driven by elapsed time, not incoming request/message count.
+Current-configuration messages have priority over retired-core traffic. These
+changes avoid a reconfiguration heartbeat feedback loop without weakening
+durability or default read barriers.
+
+`tests/cluster_rpc.rs` exercises secured add/remove, actual learner catch-up and
+forwarding, promotion, incarnation fencing, safe join/restart, leadership transfer,
+and quorum loss. `tests/protocol_simulation.rs` includes the stopped-epoch
+regression. This remains bounded one-host evidence; the external history checker,
+long fault campaign and independent failure-domain qualification are still gates.
+
 | Alternative | Value | Reason not to select it automatically |
 | --- | --- | --- |
 | Multi-Paxos through OmniPaxos | Embeddable log with pluggable storage/networking and partial-connectivity research | Needs durability, reconfiguration, learner, read, and operational qualification |

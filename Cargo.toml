@@ -20,6 +20,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 sha2 = "=0.11.1"
 thiserror = "=2.0.21"
+tempfile = "=3.27.0"
 tonic = { version = "=0.14.9", features = ["tls-ring", "gzip"] }
 tonic-prost = "=0.14.9"
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "fs", "io-util", "process"] }
@@ -35,7 +36,6 @@ tonic-prost-build = "=0.14.9"
 
 [dev-dependencies]
 omnipaxos_storage = { git = "https://github.com/haraldng/omnipaxos", rev = "9c772dcce5a9652192f45f67d9d2208b306f3bc9", default-features = false }
-tempfile = "=3.27.0"
 
 [patch."https://github.com/haraldng/omnipaxos"]
 omnipaxos = { path = "vendor/omnipaxos" }

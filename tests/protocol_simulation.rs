@@ -369,6 +369,36 @@ fn non_voting_catchup_then_committed_reconfiguration_preserves_the_prefix() {
 }
 
 #[test]
+fn stopped_configuration_can_resynchronize_without_treating_stopsign_as_a_data_entry() {
+    let mut network = Network::new();
+    network.propose(1, 1);
+    network.run(20);
+    let leader = network.leader();
+    network
+        .nodes
+        .get_mut(&leader)
+        .unwrap()
+        .reconfigure(
+            ClusterConfig {
+                configuration_id: 2,
+                nodes: vec![1, 2, 3],
+                flexible_quorum: None,
+            },
+            None,
+        )
+        .unwrap();
+    network.run(20);
+    assert!(network.nodes[&leader].is_reconfigured().is_some());
+    network.restart(leader);
+    network.run(50);
+    for node in network.nodes.values() {
+        assert_eq!(node.get_decided_idx(), 2);
+        assert!(node.is_reconfigured().is_some());
+    }
+    network.assert_equal(&[1]);
+}
+
+#[test]
 fn duplicate_reordered_and_lost_messages_do_not_diverge_decided_history() {
     fault_history_safety::<SqliteStorage<Record>>();
 }

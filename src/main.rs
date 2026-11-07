@@ -1,8 +1,8 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use etcqlite::{
     error::{Result, RpcError},
     server::{self, Options, TlsOptions},
-    storage::{Identity, Store},
+    storage::{Identity, Store, interchange, snapshot},
     wire,
 };
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
@@ -22,6 +22,38 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Inspect {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        include_data: bool,
+        #[arg(long)]
+        ack_sensitive_data: bool,
+    },
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotCommand,
+    },
+    Join {
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        member_id: u64,
+        #[arg(long, default_value = "etcqlite")]
+        name: String,
+    },
+    Migrate {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=2))]
+        target: u32,
+        #[arg(long)]
+        backup: PathBuf,
+    },
     Init {
         #[arg(long)]
         data_dir: PathBuf,
@@ -55,6 +87,60 @@ enum Command {
         peer_key_file: Option<PathBuf>,
         #[arg(long)]
         peer_ca_file: Option<PathBuf>,
+        #[arg(long)]
+        snapshot_tool: Option<PathBuf>,
+    },
+}
+
+#[derive(Args)]
+struct RestoreOptions {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long, default_value = "etcqlite")]
+    name: String,
+    #[arg(long)]
+    cluster_id: Option<u64>,
+    #[arg(long)]
+    member_id: Option<u64>,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+    revision_bump: i64,
+    #[arg(long)]
+    mark_compacted: bool,
+    #[arg(long)]
+    fenced_source: bool,
+    #[arg(long)]
+    cluster_config: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum SnapshotCommand {
+    Save {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    Status {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    Restore {
+        #[arg(long)]
+        input: PathBuf,
+        #[command(flatten)]
+        options: RestoreOptions,
+    },
+    Export {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    Import {
+        #[arg(long)]
+        input: PathBuf,
+        #[command(flatten)]
+        options: RestoreOptions,
     },
 }
 
@@ -90,6 +176,60 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Inspect {
+            data_dir,
+            output,
+            include_data,
+            ack_sensitive_data,
+        } => {
+            if include_data && !ack_sensitive_data {
+                return Err(RpcError::new(
+                    Code::PermissionDenied,
+                    "--include-data requires --ack-sensitive-data",
+                ));
+            }
+            let store = open_recovered(data_dir)?;
+            store
+                .inspection_projection(&etcqlite::storage::auth::Principal::Internal, include_data)?
+                .publish(&output)?;
+            println!(
+                "{}",
+                serde_json::json!({ "event": "projected", "revision": store.revision(), "read_only": true, "includes_data": include_data, "recoverable": false })
+            );
+            Ok(())
+        }
+        Command::Snapshot { command } => run_snapshot(command),
+        Command::Migrate {
+            data_dir,
+            target,
+            backup,
+        } => {
+            let mut store = Store::open(data_dir)?;
+            println!(
+                "{}",
+                serde_json::to_string(&store.migrate(target, &backup)?)?
+            );
+            Ok(())
+        }
+        Command::Join {
+            snapshot: input,
+            data_dir,
+            member_id,
+            name,
+        } => {
+            let info = snapshot::inspect(&input)?;
+            let result = snapshot::join(
+                &input,
+                &data_dir,
+                Identity {
+                    cluster_id: info.cluster_id,
+                    member_id,
+                    name,
+                },
+            )?;
+            println!("{}", serde_json::to_string(&result)?);
+            Ok(())
+        }
         Command::Init {
             data_dir,
             name,
@@ -148,6 +288,7 @@ async fn run(cli: Cli) -> Result<()> {
             peer_cert_file,
             peer_key_file,
             peer_ca_file,
+            snapshot_tool,
         } => {
             let tls = match (cert_file, key_file, client_ca_file) {
                 (Some(certificate), Some(key), client_ca) => Some(TlsOptions {
@@ -168,6 +309,7 @@ async fn run(cli: Cli) -> Result<()> {
                 address: listen,
                 tls,
                 request_timeout: Duration::from_millis(request_timeout_ms),
+                snapshot_tool,
                 peer: match (peer_listen, peer_cert_file, peer_key_file, peer_ca_file) {
                     (Some(address), Some(certificate), Some(key), Some(ca)) => Some(etcqlite::peer::Options { address, certificate, key, ca }),
                     (None, None, None, None) => None,
@@ -178,7 +320,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!(
                 "{}",
                 serde_json::json!({
-                    "event": "ready", "endpoint": server.endpoint,
+                    "event": "started", "endpoint": server.endpoint,
                     "engine_version": wire::ENGINE_VERSION, "api_version": wire::ETCD_API_VERSION,
                     "build": wire::BUILD_SHA,
                     "dirty": wire::BUILD_DIRTY,
@@ -188,6 +330,105 @@ async fn run(cli: Cli) -> Result<()> {
             server.shutdown().await
         }
     }
+}
+
+fn open_recovered(path: PathBuf) -> Result<Store> {
+    let mut store = Store::open(path)?;
+    if store.cluster_configuration()?.is_some() {
+        let mut replica = etcqlite::replica::Replica::open(&store)?;
+        replica.apply(&mut store)?;
+    }
+    Ok(store)
+}
+
+fn run_snapshot(command: SnapshotCommand) -> Result<()> {
+    match command {
+        SnapshotCommand::Save { data_dir, output } => {
+            let store = open_recovered(data_dir)?;
+            let saved = store
+                .native_snapshot(&etcqlite::storage::auth::Principal::Internal)?
+                .publish(&output)?;
+            println!("{}", serde_json::to_string(&saved)?);
+        }
+        SnapshotCommand::Status { input } => {
+            println!("{}", serde_json::to_string(&snapshot::inspect(&input)?)?)
+        }
+        SnapshotCommand::Export { data_dir, output } => {
+            let store = open_recovered(data_dir)?;
+            let manifest = store.application_manifest(
+                &etcqlite::storage::auth::Principal::Internal,
+                u64::from(
+                    store
+                        .cluster_configuration()?
+                        .map_or(1, |configuration| configuration.configuration_id),
+                ) << 32,
+            )?;
+            manifest.write(&output)?;
+            println!(
+                "{}",
+                serde_json::json!({ "event": "exported", "revision": manifest.revision, "compact_revision": manifest.compact_revision, "sensitive": true })
+            );
+        }
+        SnapshotCommand::Restore { input, options }
+        | SnapshotCommand::Import { input, options } => {
+            if !options.fenced_source {
+                return Err(RpcError::invalid(
+                    "restore/import requires --fenced-source after stopping or fencing all source writers; the flag is an attestation, not a live fencing mechanism",
+                ));
+            }
+            let configuration: Option<etcqlite::cluster::Configuration> = options
+                .cluster_config
+                .as_ref()
+                .map(|path| -> Result<_> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) })
+                .transpose()?;
+            if configuration.is_some() && options.member_id.is_none() {
+                return Err(RpcError::invalid("cluster restore requires --member-id"));
+            }
+            if let Some(configuration) = &configuration
+                && options
+                    .cluster_id
+                    .is_some_and(|id| id != configuration.cluster_id)
+            {
+                return Err(RpcError::invalid(
+                    "--cluster-id disagrees with the new restore configuration",
+                ));
+            }
+            let identity = Identity {
+                cluster_id: configuration.as_ref().map_or_else(
+                    || options.cluster_id.map_or_else(random_id, Ok),
+                    |configuration| Ok(configuration.cluster_id),
+                )?,
+                member_id: options.member_id.map_or_else(random_id, Ok)?,
+                name: options.name,
+            };
+            let mut signature = [0; 16];
+            use std::io::Read;
+            let mut source = std::fs::File::open(&input)?;
+            let count = source.read(&mut signature)?;
+            let native = count == 16 && signature == *b"SQLite format 3\0";
+            let result = if native {
+                snapshot::restore(
+                    &input,
+                    &options.data_dir,
+                    identity,
+                    configuration.as_ref(),
+                    options.revision_bump,
+                    options.mark_compacted,
+                )?
+            } else {
+                interchange::restore(
+                    &input,
+                    &options.data_dir,
+                    identity,
+                    configuration.as_ref(),
+                    options.revision_bump,
+                    options.mark_compacted,
+                )?
+            };
+            println!("{}", serde_json::to_string(&result)?);
+        }
+    }
+    Ok(())
 }
 
 fn random_id() -> Result<u64> {

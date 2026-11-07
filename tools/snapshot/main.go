@@ -270,8 +270,8 @@ func importSnapshot(path string) (manifest Manifest, result error) {
 					manifest.Revision = max(manifest.Revision, main)
 				}
 				if bytes.Equal(name, []byte("meta")) {
-					if bytes.Equal(key, []byte("storageVersion")) && !bytes.Equal(value, []byte("3.7.0")) {
-						return errors.New("source storage version is not the qualified 3.7.0 format")
+					if bytes.Equal(key, []byte("storageVersion")) && !bytes.Equal(value, []byte("3.7.0")) && !bytes.Equal(value, []byte("3.6.0")) {
+						return errors.New("source storage version is not a supported 3.6.0/3.7.0 format")
 					}
 					if bytes.Equal(key, []byte("finishedCompactRev")) || bytes.Equal(key, []byte("scheduledCompactRev")) {
 						compact, err := decodeRevision(value)
@@ -295,6 +295,18 @@ func importSnapshot(path string) (manifest Manifest, result error) {
 }
 
 func writeManifest(manifest Manifest, path string) (result error) {
+	// Keep empty collections and binary values canonical across Go and Rust.
+	manifest.Buckets = append([]Bucket(nil), manifest.Buckets...)
+	for index := range manifest.Buckets {
+		source := manifest.Buckets[index].Entries
+		manifest.Buckets[index].Entries = make([]BucketEntry, len(source))
+		copy(manifest.Buckets[index].Entries, source)
+		for entry := range manifest.Buckets[index].Entries {
+			if manifest.Buckets[index].Entries[entry].Value == nil {
+				manifest.Buckets[index].Entries[entry].Value = []byte{}
+			}
+		}
+	}
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".etcqlite-manifest-*")
 	if err != nil {
 		return err

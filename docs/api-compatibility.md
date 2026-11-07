@@ -1,6 +1,9 @@
 # Client API compatibility contract
 
-Status: every method below is **planned, not implemented**.
+Status: all 49 methods have native handlers in the experimental server.
+The inventory below remains an acceptance contract, not a full-compatibility
+claim. Bounded client, membership, snapshot, and recovery cases do not replace
+the full differential/fault/platform qualification matrix.
 
 Reference: etcd v3.7.3. Preserve upstream protobuf service/package names,
 method paths, request/response fields, enum values, streaming direction,
@@ -131,13 +134,35 @@ Do not imply identical internal Prometheus metric names without testing them.
 
 ## Tooling compatibility
 
-The Snapshot/Hash/HashKV/Downgrade surfaces need dedicated feasibility work.
+The current Maintenance implementation includes persisted alarms, quota/corruption
+gates, physical SQLite defragmentation, Castagnoli hashes over the exported etcd
+buckets, revision-aware HashKV and compaction hash retention, and a real
+upstream-compatible Snapshot stream. Snapshot requires the installed companion
+`etcqlite-snapshot` binary. `/version` separates the engine/build, SQLite schema,
+and exported tooling profile. The storage quota remains an explicitly reported
+logical MVCC estimate, not a hard cap on the combined application/protocol file.
+
+Clustered membership uses committed OmniPaxos StopSigns and a new-configuration
+barrier before ordinary membership responses complete. Learners persist certified
+decided prefixes without voting; promotion verifies catch-up. New join directories
+claim unique incarnations through the replicated log before client admission or
+voting. Reinitializing an already claimed member ID is rejected. Self-removal
+acknowledges the committed removal and stops the local worker.
+
+Current boundaries remain explicit: quorum configurations require at least two
+voters; local mode cannot become a peer cluster merely through MemberAdd. Fresh
+cluster bootstrap uses configuration 1; later configurations require verified join
+or disaster restore. Downgrade manages the 3.6.0 client/tooling profile and disables
+3.7-only RangeStream until cancellation. It does not install an older engine or
+prove mixed native-binary compatibility.
+
+Snapshot/Hash/HashKV/Downgrade qualification needs dedicated evidence.
 SQLite-native output is not an etcd snapshot, and a SQLite page checksum is
 not the etcd MVCC hash.
 
 Require approved tool versions and workflows to succeed, including snapshot
-save/status/restore and migration checks. Determine whether an isolated,
-non-Raft Go/bbolt converter is necessary. A helper's existence does not excuse
+save/status/restore and migration checks. The installed isolated Go/bbolt converter emits upstream snapshots without
+introducing Raft into the product. A helper's existence does not excuse
 incorrect exported metadata, revisions, auth state, or leases.
 
 Kubernetes storage compatibility, client API compatibility, and snapshot

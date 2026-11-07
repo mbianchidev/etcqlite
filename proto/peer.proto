@@ -4,6 +4,10 @@ package etcqlite.peer.v1;
 service Peer {
   rpc Exchange(stream PacketChunk) returns (PacketReceipt);
   rpc LeaseTimeToLive(LeaseQuery) returns (LeaseState);
+  rpc TransferLeader(LeadershipRequest) returns (LeadershipResponse);
+  rpc FetchDecided(CatchupRequest) returns (CatchupResponse);
+  rpc Progress(PeerQuery) returns (PeerProgress);
+  rpc Snapshot(PeerQuery) returns (stream PacketChunk);
 }
 
 message PacketChunk {
@@ -16,6 +20,8 @@ message PacketChunk {
   uint64 offset = 7;
   bytes checksum = 8;
   bytes data = 9;
+  string bootstrap_digest = 10;
+  string incarnation = 11;
 }
 
 message PacketReceipt {
@@ -29,6 +35,8 @@ message LeaseQuery {
   int64 lease_id = 4;
   bool keys = 5;
   bytes principal = 6;
+  string bootstrap_digest = 7;
+  string incarnation = 8;
 }
 
 message LeaseState {
@@ -36,4 +44,43 @@ message LeaseState {
   int64 ttl = 2;
   int64 granted_ttl = 3;
   repeated bytes keys = 4;
+}
+
+message LeadershipRequest {
+  uint64 cluster_id = 1;
+  uint64 requester_id = 2;
+  uint64 receiver_id = 3;
+  bytes principal = 4;
+  string bootstrap_digest = 5;
+  string incarnation = 6;
+}
+
+message LeadershipResponse {
+  uint64 leader_id = 1;
+  uint64 term = 2;
+  uint64 applied_index = 3;
+}
+
+message PeerQuery {
+  uint64 cluster_id = 1;
+  uint64 requester_id = 2;
+  uint64 receiver_id = 3;
+  string bootstrap_digest = 4;
+  string incarnation = 5;
+}
+
+message PeerProgress {
+  uint32 configuration_id = 1;
+  uint64 applied_index = 2;
+  bool learner = 3;
+}
+
+message CatchupRequest {
+  PeerQuery peer = 1;
+  uint32 configuration_id = 2;
+  uint64 from = 3;
+}
+
+message CatchupResponse {
+  bytes frame = 1;
 }

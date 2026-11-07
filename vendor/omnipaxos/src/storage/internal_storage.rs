@@ -318,10 +318,10 @@ where
     ) -> StorageResult<usize> {
         if let Some(sync) = &log_sync {
             debug_assert!(
-                sync.sync_idx >= self.state_cache.decided_idx,
+                sync.sync_idx >= self.get_decided_idx_without_stopsign(),
                 "log sync from {} would overwrite decided entries up to {}",
                 sync.sync_idx,
-                self.state_cache.decided_idx
+                self.get_decided_idx_without_stopsign()
             );
         }
         // A leader that completed Prepare without this node's Promise can be
@@ -484,7 +484,7 @@ where
         self.state_cache.decided_idx
     }
 
-    fn get_decided_idx_without_stopsign(&self) -> usize {
+    pub(crate) fn get_decided_idx_without_stopsign(&self) -> usize {
         match self.stopsign_is_decided() {
             true => self.get_decided_idx() - 1,
             false => self.get_decided_idx(),

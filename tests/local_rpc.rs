@@ -8,6 +8,10 @@ use tempfile::TempDir;
 use tonic::Request;
 
 async fn start() -> (TempDir, RunningServer) {
+    start_with_tool(None).await
+}
+
+async fn start_with_tool(snapshot_tool: Option<std::path::PathBuf>) -> (TempDir, RunningServer) {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("node");
     drop(
@@ -27,6 +31,7 @@ async fn start() -> (TempDir, RunningServer) {
         tls: None,
         request_timeout: Duration::from_secs(5),
         peer: None,
+        snapshot_tool,
     })
     .await
     .unwrap();
@@ -83,6 +88,423 @@ async fn grpc_binary_kv_transactions_and_headers_are_live_not_stubs() {
         .into_inner();
     assert!(response.succeeded);
     assert_eq!(response.header.unwrap().revision, 3);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_artifacts_require_resource_identity_and_explicit_raw_data_consent() {
+    let (directory, server) = start().await;
+    let headers = directory.path().join("headers");
+    let output = tokio::process::Command::new("curl")
+        .args(["-sS", "-D"])
+        .arg(&headers)
+        .arg(format!("{}/etcqlite/v1/discovery", server.endpoint))
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let descriptor: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(descriptor["member_id"], "22");
+    let header = std::fs::read_to_string(headers).unwrap();
+    let etag = header
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("etag:"))
+        .unwrap()
+        .split_once(':')
+        .unwrap()
+        .1
+        .trim();
+    let projection = directory.path().join("projection.db");
+    for (identity, body, expected) in [
+        ("\"stale\"", "{}", "412"),
+        (etag, "{\"include_data\":true}", "403"),
+        (etag, "{}", "200"),
+    ] {
+        let output = tokio::process::Command::new("curl")
+            .args(["-sS", "-o"])
+            .arg(&projection)
+            .args([
+                "-w",
+                "%{http_code}",
+                "-H",
+                &format!("If-Match: {identity}"),
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                body,
+            ])
+            .arg(format!("{}/etcqlite/v1/projections", server.endpoint))
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        projection,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let kind: String = connection
+        .query_row("SELECT kind FROM projection_metadata", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(kind, "read-only-inspection");
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn maintenance_snapshot_is_an_upstream_image_and_hashes_its_actual_buckets() {
+    let tools = TempDir::new().unwrap();
+    let converter = tools.path().join("etcqlite-snapshot");
+    let output = tokio::process::Command::new("go")
+        .args(["build", "-o"])
+        .arg(&converter)
+        .arg("./snapshot")
+        .current_dir(format!("{}/tools", env!("CARGO_MANIFEST_DIR")))
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_directory, server) = start_with_tool(Some(converter.clone())).await;
+    let mut kv = pb::kv_client::KvClient::connect(server.endpoint.clone())
+        .await
+        .unwrap();
+    kv.put(pb::PutRequest {
+        key: vec![0, 255, 128],
+        value: vec![128, 0, 255],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let mut maintenance =
+        pb::maintenance_client::MaintenanceClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+    let mut stream = maintenance
+        .snapshot(pb::SnapshotRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bytes = Vec::new();
+    let mut remaining = u64::MAX;
+    while let Some(chunk) = stream.message().await.unwrap() {
+        if bytes.is_empty() {
+            assert_eq!(chunk.header.unwrap().revision, 2);
+        }
+        assert!(chunk.remaining_bytes < remaining);
+        remaining = chunk.remaining_bytes;
+        bytes.extend(chunk.blob);
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(bytes.len() % 512, 32);
+    let image = tools.path().join("snapshot.db");
+    std::fs::write(&image, bytes).unwrap();
+    let manifest = tools.path().join("manifest.json");
+    let output = tokio::process::Command::new(converter)
+        .arg("import")
+        .arg(image)
+        .arg(&manifest)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let imported = etcqlite::storage::interchange::Manifest::read(&manifest).unwrap();
+    assert_eq!(imported.revision, 2);
+    assert_eq!(
+        maintenance
+            .hash(pb::HashRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .hash,
+        imported.hash()
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn maintenance_alarms_fence_writes_and_can_be_cleared_without_losing_data() {
+    let (_directory, server) = start().await;
+    let mut kv = pb::kv_client::KvClient::connect(server.endpoint.clone())
+        .await
+        .unwrap();
+    let mut maintenance =
+        pb::maintenance_client::MaintenanceClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+    kv.put(pb::PutRequest {
+        key: b"mock/alarm".to_vec(),
+        value: b"before".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let response = maintenance
+        .alarm(pb::AlarmRequest {
+            action: 1,
+            member_id: 22,
+            alarm: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.alarms,
+        vec![pb::AlarmMember {
+            member_id: 22,
+            alarm: 1
+        }]
+    );
+    let error = kv
+        .put(pb::PutRequest {
+            key: b"mock/alarm".to_vec(),
+            value: b"blocked".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    let mut leases = pb::lease_client::LeaseClient::connect(server.endpoint.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        leases
+            .lease_grant(pb::LeaseGrantRequest { id: 7, ttl: 60 })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        kv.range(pb::RangeRequest {
+            key: b"mock/alarm".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .kvs[0]
+            .value,
+        b"before"
+    );
+    maintenance
+        .alarm(pb::AlarmRequest {
+            action: 2,
+            member_id: 22,
+            alarm: 1,
+        })
+        .await
+        .unwrap();
+    kv.put(pb::PutRequest {
+        key: b"mock/alarm".to_vec(),
+        value: b"after".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let status = maintenance
+        .status(pb::StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(status.db_size >= status.db_size_in_use && status.db_size_in_use > 0);
+    assert!(status.errors.is_empty());
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn maintenance_hashes_track_history_and_keep_the_compaction_hash() {
+    let (_directory, server) = start().await;
+    let mut kv = pb::kv_client::KvClient::connect(server.endpoint.clone())
+        .await
+        .unwrap();
+    let mut maintenance =
+        pb::maintenance_client::MaintenanceClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+    let empty = maintenance
+        .hash_kv(pb::HashKvRequest { revision: 0 })
+        .await
+        .unwrap()
+        .into_inner();
+    for value in [vec![0, 255], vec![255, 0], vec![0, 255]] {
+        kv.put(pb::PutRequest {
+            key: vec![0, 255, 128],
+            value,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let before = maintenance
+        .hash_kv(pb::HashKvRequest { revision: 4 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(before.hash_revision, 4);
+    assert_ne!(before.hash, empty.hash);
+    kv.compact(pb::CompactionRequest {
+        revision: 4,
+        physical: true,
+    })
+    .await
+    .unwrap();
+    let retained = maintenance
+        .hash_kv(pb::HashKvRequest { revision: 4 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retained.hash, before.hash);
+    assert_eq!(retained.compact_revision, before.compact_revision);
+    let latest = maintenance
+        .hash_kv(pb::HashKvRequest { revision: 0 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(latest.compact_revision, 4);
+    assert_ne!(latest.hash, before.hash);
+    assert_eq!(
+        maintenance
+            .hash_kv(pb::HashKvRequest { revision: 3 })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::OutOfRange
+    );
+    assert_eq!(
+        maintenance
+            .hash_kv(pb::HashKvRequest { revision: 5 })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::OutOfRange
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn corruption_alarm_blocks_reads_without_preventing_operator_repair() {
+    let (_directory, server) = start().await;
+    let mut maintenance =
+        pb::maintenance_client::MaintenanceClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+    maintenance
+        .alarm(pb::AlarmRequest {
+            action: 1,
+            member_id: 22,
+            alarm: 2,
+        })
+        .await
+        .unwrap();
+    let mut kv = pb::kv_client::KvClient::connect(server.endpoint.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        kv.range(pb::RangeRequest {
+            key: b"mock/corrupt".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::DataLoss
+    );
+    maintenance
+        .alarm(pb::AlarmRequest {
+            action: 2,
+            member_id: 22,
+            alarm: 2,
+        })
+        .await
+        .unwrap();
+    kv.put(pb::PutRequest {
+        key: b"mock/corrupt".to_vec(),
+        value: b"repaired".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn downgrade_changes_the_protocol_profile_and_cancel_restores_streaming() {
+    let (_directory, server) = start().await;
+    let mut maintenance =
+        pb::maintenance_client::MaintenanceClient::connect(server.endpoint.clone())
+            .await
+            .unwrap();
+    assert_eq!(
+        maintenance
+            .downgrade(pb::DowngradeRequest {
+                action: 0,
+                version: "3.6.0".into()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .version,
+        "3.7.0"
+    );
+    maintenance
+        .downgrade(pb::DowngradeRequest {
+            action: 1,
+            version: "3.6.0".into(),
+        })
+        .await
+        .unwrap();
+    let status = maintenance
+        .status(pb::StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.storage_version, "3.6.0");
+    assert_eq!(status.downgrade_info.unwrap().target_version, "3.6.0");
+    let mut kv = pb::kv_client::KvClient::connect(server.endpoint.clone())
+        .await
+        .unwrap();
+    let error = kv
+        .range_stream(pb::RangeRequest {
+            key: b"mock/downgrade".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code(), tonic::Code::Unimplemented);
+    maintenance
+        .downgrade(pb::DowngradeRequest {
+            action: 2,
+            version: String::new(),
+        })
+        .await
+        .unwrap();
+    kv.range_stream(pb::RangeRequest {
+        key: b"mock/downgrade".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        maintenance
+            .downgrade(pb::DowngradeRequest {
+                action: 0,
+                version: "3.5.0".into()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
     server.shutdown().await.unwrap();
 }
 
@@ -265,6 +687,7 @@ async fn public_plaintext_listener_is_refused_before_serving() {
         tls: None,
         request_timeout: Duration::from_secs(5),
         peer: None,
+        snapshot_tool: None,
     })
     .await;
     assert!(result.is_err());

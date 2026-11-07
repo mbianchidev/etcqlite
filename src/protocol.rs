@@ -28,6 +28,27 @@ pub enum StorageError {
 
 type Result<T> = std::result::Result<T, StorageError>;
 
+pub(crate) fn verify_database(connection: &Connection) -> Result<()> {
+    let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'protocol_state')", [], |row| row.get(0))?;
+    if !exists {
+        return Ok(());
+    }
+    let mut statement =
+        connection.prepare("SELECT configuration_id, checksum FROM protocol_state")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let configuration_id: u32 = row.get(0)?;
+        let checksum: Vec<u8> = row.get(1)?;
+        let state = read_state(connection, configuration_id)?;
+        ensure(
+            state_digest(&state)? == checksum,
+            "protocol metadata checksum mismatch",
+        )?;
+        validate_state(connection, configuration_id, &state)?;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct State {
     promise: Option<Vec<u8>>,
@@ -61,7 +82,7 @@ where
         )?;
         crate::sqlite::configure(&connection)?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        ensure(version <= 1, "unsupported protocol storage schema version")?;
+        ensure(version <= 2, "unsupported protocol storage schema version")?;
         connection.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE IF NOT EXISTS protocol_state (
@@ -82,9 +103,11 @@ where
                  checksum BLOB NOT NULL,
                  PRIMARY KEY (configuration_id, log_idx)
              ) STRICT;
-             PRAGMA user_version = 1;
              COMMIT;",
         )?;
+        if version == 0 {
+            connection.pragma_update(None, "user_version", 1)?;
+        }
         let initial = State {
             promise: None,
             accepted_round: None,
@@ -156,16 +179,33 @@ where
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut state = read_state(&transaction, config)?;
-        let immutable_prefix = state.decided;
+        let immutable_prefix = state.decided.min(state.end);
+        let immutable_stopsign = if state.decided > state.end {
+            state.stopsign.clone()
+        } else {
+            None
+        };
         for operation in operations {
             match operation {
                 StorageOp::AppendEntry(entry) => {
+                    ensure(
+                        immutable_stopsign.is_none(),
+                        "cannot append data after a decided StopSign",
+                    )?;
                     append(&transaction, config, &mut state.end, vec![entry])?;
                 }
                 StorageOp::AppendEntries(entries) => {
+                    ensure(
+                        immutable_stopsign.is_none() || entries.is_empty(),
+                        "cannot append data after a decided StopSign",
+                    )?;
                     append(&transaction, config, &mut state.end, entries)?;
                 }
                 StorageOp::AppendOnPrefix(from, entries) => {
+                    ensure(
+                        immutable_stopsign.is_none() || entries.is_empty(),
+                        "cannot append a suffix after a decided StopSign",
+                    )?;
                     let from = index(from)?;
                     ensure(
                         from >= immutable_prefix,
@@ -173,7 +213,10 @@ where
                     )?;
                     ensure(
                         from >= state.compacted && from <= state.end,
-                        "append prefix is outside the stored log",
+                        &format!(
+                            "append prefix {from} is outside configuration {config} log [{}, {}], decided {}",
+                            state.compacted, state.end, state.decided
+                        ),
                     )?;
                     transaction.execute(
                         "DELETE FROM protocol_entries WHERE configuration_id = ?1 AND log_idx >= ?2",
@@ -205,6 +248,10 @@ where
                 }
                 StorageOp::Trim(to) => {
                     let to = index(to)?;
+                    ensure(
+                        immutable_stopsign.is_none() || to <= state.end,
+                        "cannot trim beyond the data prefix of a decided StopSign",
+                    )?;
                     ensure(to >= state.compacted, "trim position cannot decrease")?;
                     transaction.execute(
                         "DELETE FROM protocol_entries WHERE configuration_id = ?1 AND log_idx < ?2",
@@ -213,6 +260,17 @@ where
                     state.end = state.end.max(to);
                 }
                 StorageOp::SetStopsign(stopsign) => {
+                    if let Some(expected) = &immutable_stopsign {
+                        ensure(
+                            stopsign
+                                .as_ref()
+                                .map(serde_json::to_vec)
+                                .transpose()?
+                                .as_ref()
+                                == Some(expected),
+                            "a decided StopSign cannot be replaced or removed",
+                        )?;
+                    }
                     if let Some(stopsign) = &stopsign {
                         ensure(
                             stopsign.next_config.configuration_id > config,
