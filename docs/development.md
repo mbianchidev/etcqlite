@@ -72,6 +72,11 @@ Generate **synthetic development-only** certificates in a new directory:
 go -C tools run ./certs --out /path/to/new-private-test-pki --cluster-id 42 --members 1,2,3
 ```
 
+For isolated guest experiments, `--hosts` accepts an explicit comma-separated
+IP/DNS SAN list. Include only the owned endpoints, for example
+`127.0.0.1,localhost,lima-mock-node.internal`. The helper is development-only,
+uses a short-lived synthetic CA and never grants unlisted hostnames.
+
 The TLS three-voter case verifies replication, one unavailable voter, and
 quorum-loss fencing. This is bounded one-host evidence, not multi-host HA or
 production qualification. Dynamic add/remove/update, learner bootstrap/promotion and safe

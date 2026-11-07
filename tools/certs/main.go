@@ -24,16 +24,40 @@ func main() {
 	out := flag.String("out", "", "new private output directory for synthetic development certificates")
 	cluster := flag.Uint64("cluster-id", 42, "synthetic cluster ID")
 	members := flag.String("members", "1,2,3", "comma-separated synthetic member IDs")
+	hosts := flag.String("hosts", "127.0.0.1,localhost", "comma-separated approved development IP/DNS names")
 	flag.Parse()
-	if err := create(*out, *cluster, *members); err != nil {
+	if err := createForHosts(*out, *cluster, *members, *hosts); err != nil {
 		fmt.Fprintln(os.Stderr, "development certificate generation:", err)
 		os.Exit(1)
 	}
 }
 
-func create(out string, cluster uint64, members string) error {
+func createForHosts(out string, cluster uint64, members, hosts string) error {
 	if out == "" || cluster == 0 {
 		return fmt.Errorf("--out and a nonzero --cluster-id are required")
+	}
+	var ips []net.IP
+	var names []string
+	seen := make(map[string]bool)
+	for _, host := range strings.Split(hosts, ",") {
+		host = strings.TrimSpace(host)
+		if host == "" || len(host) > 253 {
+			return errors.New("development certificate hosts must be explicit bounded names")
+		}
+		if seen[host] {
+			continue
+		}
+		seen[host] = true
+		if ip := net.ParseIP(host); ip != nil {
+			ips = append(ips, ip)
+		} else {
+			for _, character := range host {
+				if !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '.' || character == '-') {
+					return errors.New("invalid development certificate DNS name")
+				}
+			}
+			names = append(names, host)
+		}
 	}
 	if err := os.Mkdir(out, 0o700); err != nil {
 		return fmt.Errorf("create new private output directory: %w", err)
@@ -88,7 +112,7 @@ func create(out string, cluster uint64, members string) error {
 			BasicConstraintsValid: true,
 			KeyUsage:              x509.KeyUsageDigitalSignature,
 			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-			IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")}, DNSNames: []string{"localhost"},
+			IPAddresses:           ips, DNSNames: names,
 			URIs: []*url.URL{identity},
 		}
 		der, err := x509.CreateCertificate(rand.Reader, member, ca, &memberKey.PublicKey, key)
