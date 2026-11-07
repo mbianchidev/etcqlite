@@ -65,6 +65,8 @@ enum Command {
         member_id: Option<u64>,
         #[arg(long)]
         cluster_config: Option<PathBuf>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+        quota_bytes: Option<u64>,
     },
     Serve {
         #[arg(long)]
@@ -236,6 +238,7 @@ async fn run(cli: Cli) -> Result<()> {
             cluster_id,
             member_id,
             cluster_config,
+            quota_bytes,
         } => {
             let configuration = cluster_config
                 .map(|path| -> Result<etcqlite::cluster::Configuration> {
@@ -265,6 +268,9 @@ async fn run(cli: Cli) -> Result<()> {
                 name,
             };
             let mut store = Store::create(data_dir, identity)?;
+            if let Some(bytes) = quota_bytes {
+                store.bootstrap_quota(bytes)?;
+            }
             if let Some(configuration) = &configuration {
                 store.configure_cluster(configuration)?;
             }

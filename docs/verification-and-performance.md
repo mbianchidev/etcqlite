@@ -39,6 +39,28 @@ forwarding. They share one physical host and must not be described as host-level
 HA. Primary throughput, long campaigns and recovery results remain unqualified
 until their actual evidence exists.
 
+The `tools/qualification` runner seeds synthetic 64-byte keys/1024-byte values
+through durable API transactions, starts fixed prefix watches, and issues exact
+100-operation cycles with the frozen 60/10/20/10 mix. It records exact per-operation
+latencies, including p99/p99.9, errors and warmup errors in new mode-0600 JSON
+reports. It refuses a nonempty fixture namespace, HTTP endpoints, unbounded
+workers, or silent latency sampling. Smaller/shorter probes are explicitly
+`primary_workload_shape: false`, never production evidence.
+
+```sh
+GOMAXPROCS=2 go -C tools run ./qualification \
+  --endpoints https://node1:2379,https://node2:2379,https://node3:2379 \
+  --ca ./fixture-ca.crt --cert ./fixture-client.crt --key ./fixture-client.key \
+  --engine <exact-build> --output ./new-report.json --owned-fixture
+```
+
+Primary candidate/reference nodes use equal explicit 8-GiB quota settings
+alongside their 4-vCPU/8-GiB process budgets. The larger quota permits the
+predeclared retained-history dataset without changing the durability/read
+contract. Sustainable capacity sweeps, five alternating paired samples, full
+fault/history checks and topology disclosure remain required; one successful
+probe does not meet the faster/production gate.
+
 **No CI is authorized.** Run future checks manually in isolated development
 workspaces after implementation is requested. Do not enable Actions or add
 workflows merely because this document describes repeatable checks.

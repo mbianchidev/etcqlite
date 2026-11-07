@@ -365,6 +365,32 @@ impl Store {
         self.metadata.quota_bytes
     }
 
+    pub fn bootstrap_quota(&mut self, bytes: u64) -> Result<()> {
+        self.ready()?;
+        if bytes == 0
+            || bytes > i64::MAX as u64
+            || self.applied_index() != 0
+            || self.revision() != 1
+            || self.metadata.logical_bytes != 0
+        {
+            return Err(RpcError::invalid(
+                "quota configuration requires a fresh empty node and a positive signed-range byte limit",
+            ));
+        }
+        let result = (|| {
+            let mut metadata = self.metadata.clone();
+            metadata.quota_bytes = bytes;
+            let transaction = self
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            save_metadata(&transaction, &metadata)?;
+            transaction.commit()?;
+            self.metadata = metadata;
+            Ok(())
+        })();
+        self.guard(result)
+    }
+
     pub fn downgrade_target(&self) -> Option<&str> {
         self.metadata.downgrade_target.as_deref()
     }

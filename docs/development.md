@@ -13,6 +13,10 @@ target/release/etcqlite serve --data-dir ./local-node --listen 127.0.0.1:2379
 ```
 
 Initialization is explicit and refuses nonempty data directories. Restart
+An explicitly supplied `init --quota-bytes <positive-bytes>` persists the logical
+MVCC quota on a fresh node; it is not an online quota change. The default remains
+2 GiB. Qualification uses equal explicitly configured quota limits for candidate
+and reference rather than changing acknowledgment or consistency rules. Restart
 uses the persisted identity. One dedicated writer owns the node lock and
 SQLite application transactions. Ctrl-C/SIGTERM stops admission and drains
 the owned runtime; user data is never deleted.
