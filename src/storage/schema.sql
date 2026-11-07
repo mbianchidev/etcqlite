@@ -100,6 +100,12 @@ CREATE TABLE removed_members (
     id BLOB PRIMARY KEY CHECK(length(id) = 8)
 ) STRICT;
 
+CREATE TABLE cluster_configuration (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    configuration BLOB NOT NULL,
+    checksum BLOB NOT NULL
+) STRICT;
+
 CREATE TABLE alarms (
     member_id BLOB NOT NULL CHECK(length(member_id) = 8),
     alarm INTEGER NOT NULL CHECK(alarm IN (1, 2)),

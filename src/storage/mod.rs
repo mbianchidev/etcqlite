@@ -113,6 +113,92 @@ pub(crate) struct Apply<'a> {
 }
 
 impl Store {
+    pub fn configure_cluster(
+        &mut self,
+        configuration: &crate::cluster::Configuration,
+    ) -> Result<()> {
+        self.ready()?;
+        configuration.validate()?;
+        configuration.member(self.identity.member_id)?;
+        if configuration.cluster_id != self.identity.cluster_id
+            || self.applied_index() != 0
+            || self.revision() != 1
+        {
+            return Err(RpcError::new(
+                Code::FailedPrecondition,
+                "cluster bootstrap requires a newly initialized empty node with the same cluster identity",
+            ));
+        }
+        let result = (|| {
+            use prost::Message;
+            let bytes = serde_json::to_vec(configuration)?;
+            let transaction = self
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "INSERT INTO cluster_configuration(id, configuration, checksum) VALUES(1, ?1, ?2)",
+                params![bytes, digest(&[&bytes])],
+            )?;
+            transaction.execute(
+                "UPDATE node_state SET mode = 'cluster', checksum = ?1 WHERE id = 1",
+                [identity_digest(&self.identity, "cluster", 0)?],
+            )?;
+            transaction.execute("DELETE FROM cluster_members", [])?;
+            for member in &configuration.members {
+                let wire = pb::Member {
+                    id: member.id,
+                    name: member.name.clone(),
+                    peer_ur_ls: vec![member.peer_url.clone()],
+                    client_ur_ls: vec![member.client_url.clone()],
+                    is_learner: member.learner,
+                };
+                let bytes = wire.encode_to_vec();
+                transaction.execute(
+                    "INSERT INTO cluster_members(id, pid, member, checksum) VALUES(?1, ?2, ?3, ?4)",
+                    params![
+                        member.id.to_be_bytes(),
+                        signed(member.pid)?,
+                        bytes,
+                        digest(&[&member.id.to_be_bytes(), &bytes])
+                    ],
+                )?;
+            }
+            let mut metadata = self.metadata.clone();
+            metadata.configuration_id = configuration.configuration_id;
+            save_metadata(&transaction, &metadata)?;
+            transaction.commit()?;
+            self.metadata = metadata;
+            Ok(())
+        })();
+        self.guard(result)
+    }
+
+    pub fn cluster_configuration(&self) -> Result<Option<crate::cluster::Configuration>> {
+        self.ready()?;
+        self.guard((|| {
+            let mode: String = self.connection.query_row(
+                "SELECT mode FROM node_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            if mode == "local" {
+                return Ok(None);
+            }
+            let (bytes, checksum): (Vec<u8>, Vec<u8>) = self.connection.query_row(
+                "SELECT configuration, checksum FROM cluster_configuration WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if digest(&[&bytes]) != checksum {
+                return Err(RpcError::corrupt("cluster configuration checksum mismatch"));
+            }
+            let configuration: crate::cluster::Configuration = serde_json::from_slice(&bytes)?;
+            configuration.validate()?;
+            configuration.member(self.identity.member_id)?;
+            Ok(Some(configuration))
+        })())
+    }
+
     pub fn begin_session(&mut self, client_url: &str) -> Result<u64> {
         self.ready()?;
         let result = (|| {
@@ -121,11 +207,16 @@ impl Store {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            if mode != "local" {
-                return Err(RpcError::new(
-                    Code::FailedPrecondition,
-                    "cluster mode requires the replicated runtime",
-                ));
+            if mode == "cluster" {
+                let configuration = self
+                    .cluster_configuration()?
+                    .ok_or_else(|| RpcError::corrupt("cluster mode has no configuration"))?;
+                if configuration.member(self.identity.member_id)?.client_url != client_url {
+                    return Err(RpcError::new(
+                        Code::FailedPrecondition,
+                        "client listener does not match the persisted cluster endpoint",
+                    ));
+                }
             }
             let epoch = epoch
                 .checked_add(1)
@@ -146,11 +237,13 @@ impl Store {
             };
             use prost::Message;
             let bytes = member.encode_to_vec();
-            transaction.execute(
+            if mode == "local" {
+                transaction.execute(
                 "INSERT INTO cluster_members(id, pid, member, checksum) VALUES(?1, 1, ?2, ?3)
                  ON CONFLICT(id) DO UPDATE SET member = excluded.member, checksum = excluded.checksum",
                 params![member.id.to_be_bytes(), bytes, digest(&[&member.id.to_be_bytes(), &bytes])],
             )?;
+            }
             transaction.commit()?;
             u64::try_from(epoch).map_err(|_| RpcError::corrupt("negative local epoch"))
         })();

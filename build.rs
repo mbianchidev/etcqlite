@@ -16,6 +16,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "proto/etcd/server/lease/leasepb/lease.proto",
                 "proto/v3lock.proto",
                 "proto/v3election.proto",
+                "proto/peer.proto",
             ],
             &["proto"],
         )?;

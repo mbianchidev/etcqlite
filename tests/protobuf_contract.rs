@@ -9,6 +9,7 @@ fn inventory_has_exactly_the_pinned_49_unique_rpcs() {
     let actual: BTreeSet<_> = descriptor
         .file
         .into_iter()
+        .filter(|file| file.package.as_deref() != Some("etcqlite.peer.v1"))
         .flat_map(|file| {
             let package = file.package.unwrap_or_default();
             file.service.into_iter().flat_map(move |service| {

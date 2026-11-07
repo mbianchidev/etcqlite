@@ -15,6 +15,10 @@ package!(leasepb, "leasepb");
 package!(v3lockpb, "v3lockpb");
 package!(v3electionpb, "v3electionpb");
 
+pub mod peer {
+    tonic::include_proto!("etcqlite.peer.v1");
+}
+
 pub const DESCRIPTORS: &[u8] = tonic::include_file_descriptor_set!("api");
 pub const ETCD_API_VERSION: &str = "3.7.3";
 pub const ETCD_SOURCE_COMMIT: &str = "0a173d0410a96d01091b484daae81365bbcde57e";

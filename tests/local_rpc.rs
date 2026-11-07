@@ -26,6 +26,7 @@ async fn start() -> (TempDir, RunningServer) {
         address: "127.0.0.1:0".parse().unwrap(),
         tls: None,
         request_timeout: Duration::from_secs(5),
+        peer: None,
     })
     .await
     .unwrap();
@@ -263,6 +264,7 @@ async fn public_plaintext_listener_is_refused_before_serving() {
         address: "0.0.0.0:0".parse().unwrap(),
         tls: None,
         request_timeout: Duration::from_secs(5),
+        peer: None,
     })
     .await;
     assert!(result.is_err());

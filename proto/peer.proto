@@ -1,0 +1,39 @@
+syntax = "proto3";
+package etcqlite.peer.v1;
+
+service Peer {
+  rpc Exchange(stream PacketChunk) returns (PacketReceipt);
+  rpc LeaseTimeToLive(LeaseQuery) returns (LeaseState);
+}
+
+message PacketChunk {
+  uint64 cluster_id = 1;
+  uint32 configuration_id = 2;
+  uint64 sender_id = 3;
+  uint64 receiver_id = 4;
+  bytes message_id = 5;
+  uint64 total_bytes = 6;
+  uint64 offset = 7;
+  bytes checksum = 8;
+  bytes data = 9;
+}
+
+message PacketReceipt {
+  bytes message_id = 1;
+}
+
+message LeaseQuery {
+  uint64 cluster_id = 1;
+  uint64 requester_id = 2;
+  uint64 receiver_id = 3;
+  int64 lease_id = 4;
+  bool keys = 5;
+  bytes principal = 6;
+}
+
+message LeaseState {
+  int64 lease_id = 1;
+  int64 ttl = 2;
+  int64 granted_ttl = 3;
+  repeated bytes keys = 4;
+}

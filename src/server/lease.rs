@@ -142,6 +142,48 @@ impl pb::lease_server::Lease for Api {
             .barrier()
             .await
             .map_err(|error| error.status())?;
+        let authority = self
+            .runtime
+            .read(|store, state| {
+                Ok((
+                    state.cluster.clone(),
+                    state.leader_id,
+                    store.identity().member_id,
+                ))
+            })
+            .await
+            .map_err(|error| error.status())?;
+        if let (Some(configuration), Some(leader), own) = authority
+            && leader != own
+        {
+            let options = self
+                .peer_tls
+                .clone()
+                .ok_or_else(|| Status::failed_precondition("cluster peer TLS is unavailable"))?;
+            let state = crate::peer::lease_query(
+                configuration,
+                own,
+                leader,
+                principal,
+                request.id,
+                request.keys,
+                options,
+            )
+            .await
+            .map_err(|error| error.status())?;
+            return self.response(pb::LeaseTimeToLiveResponse {
+                header: Some(
+                    self.runtime
+                        .header()
+                        .await
+                        .map_err(|error| error.status())?,
+                ),
+                id: state.lease_id,
+                ttl: state.ttl,
+                granted_ttl: state.granted_ttl,
+                keys: state.keys,
+            });
+        }
         let response = self
             .runtime
             .read(move |store, state| {

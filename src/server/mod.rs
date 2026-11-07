@@ -35,6 +35,7 @@ pub struct Api {
     pub(crate) runtime: Runtime,
     password_slots: Arc<Semaphore>,
     watch_slots: Arc<Semaphore>,
+    pub(crate) peer_tls: Option<crate::peer::Options>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +51,7 @@ pub struct Options {
     pub address: SocketAddr,
     pub tls: Option<TlsOptions>,
     pub request_timeout: Duration,
+    pub peer: Option<crate::peer::Options>,
 }
 
 pub struct RunningServer {
@@ -58,6 +60,7 @@ pub struct RunningServer {
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Result<()>>,
     worker: Worker,
+    peer: Option<crate::peer::RunningPeer>,
 }
 
 impl RunningServer {
@@ -73,11 +76,33 @@ impl RunningServer {
             .await
             .map_err(|error| RpcError::corrupt(format!("server task: {error}")))?;
         let writer = self.worker.shutdown().await;
-        serving.and(writer)
+        let peer = match self.peer {
+            Some(peer) => peer.shutdown().await,
+            None => Ok(()),
+        };
+        serving.and(writer).and(peer)
     }
 }
 
 pub async fn start(options: Options) -> Result<RunningServer> {
+    let configuration = {
+        let store = crate::storage::Store::open(&options.data_dir)?;
+        store
+            .cluster_configuration()?
+            .map(|configuration| (configuration, store.identity().member_id))
+    };
+    if configuration.is_some()
+        && (options.peer.is_none()
+            || options
+                .tls
+                .as_ref()
+                .is_none_or(|tls| tls.client_ca.is_none()))
+    {
+        return Err(RpcError::new(
+            Code::FailedPrecondition,
+            "cluster serving requires authenticated client and peer TLS options",
+        ));
+    }
     if !options.address.ip().is_loopback()
         && options
             .tls
@@ -117,12 +142,51 @@ pub async fn start(options: Options) -> Result<RunningServer> {
             "http"
         }
     );
+    let endpoint = if let Some((configuration, member)) = &configuration {
+        let advertised = configuration.member(*member)?.client_url.clone();
+        let uri: axum::http::Uri = advertised
+            .parse()
+            .map_err(|_| RpcError::invalid("persisted client endpoint is invalid"))?;
+        if uri.port_u16() != Some(address.port()) {
+            return Err(RpcError::new(
+                Code::FailedPrecondition,
+                "client listener port does not match the persisted advertised endpoint",
+            ));
+        }
+        advertised
+    } else {
+        endpoint
+    };
     let (runtime, worker) =
         Runtime::open(options.data_dir, endpoint.clone(), options.request_timeout).await?;
+    let peer_tls = options.peer.clone();
+    let peer = match (configuration, options.peer) {
+        (Some((configuration, member)), Some(options)) => {
+            match crate::peer::start(configuration, member, runtime.clone(), options).await {
+                Ok(peer) => Some(peer),
+                Err(error) => {
+                    worker.shutdown().await?;
+                    return Err(error);
+                }
+            }
+        }
+        (None, None) => None,
+        (None, Some(_)) => {
+            worker.shutdown().await?;
+            return Err(RpcError::invalid(
+                "peer listener cannot be enabled on a local database",
+            ));
+        }
+        _ => {
+            worker.shutdown().await?;
+            return Err(RpcError::invalid("cluster peer options are incomplete"));
+        }
+    };
     let api = Api {
         runtime: runtime.clone(),
         password_slots: Arc::new(Semaphore::new(4)),
         watch_slots: Arc::new(Semaphore::new(256)),
+        peer_tls,
     };
     let routes = Routes::new(
         pb::kv_server::KvServer::new(api.clone())
@@ -170,6 +234,7 @@ pub async fn start(options: Options) -> Result<RunningServer> {
         shutdown,
         task,
         worker,
+        peer,
     })
 }
 

@@ -31,6 +31,50 @@ RangeStream intentionally has no REST mapping, matching the pinned source.
 Cluster/Maintenance serving and distributed semantic closure remain separate
 pending gates, not successful no-op methods.
 
+## Static clustered experiment
+
+The native runtime now routes mutations and ordered read barriers through the
+maintained OmniPaxos core and durable SQLite adapter. Apply/result publication
+follows only decided entries. Loss of quorum does not enable local writes or
+default stale reads; explicit serializable reads remain separate.
+
+Use a shared JSON configuration with nonzero `cluster_id`,
+`configuration_id`, and `members`. Each member has `id`, bounded distinct
+`pid`, `name`, `client_url`, `peer_url`, and optional `learner`.
+Client/peer URLs must be HTTPS. Initialize every fresh node explicitly:
+
+```sh
+target/release/etcqlite init --data-dir ./node-1 --cluster-config ./cluster.json --member-id 1
+target/release/etcqlite serve --data-dir ./node-1 --listen 127.0.0.1:2379 \
+  --cert-file ./member-1.crt --key-file ./member-1.key --client-ca-file ./ca.crt \
+  --peer-listen 127.0.0.1:2380 \
+  --peer-cert-file ./member-1.crt --peer-key-file ./member-1.key --peer-ca-file ./ca.crt
+```
+
+The listen ports must match the configured advertised ports. Wildcard binding
+does not rewrite the advertised identities/endpoints. Config changes never
+reinterpret an existing local database as a quorum cluster.
+
+Peer certificates require a URI SAN binding
+`spiffe://etcqlite/<16-digit-hex-cluster-id>/<16-digit-hex-member-id>`.
+Authenticated peer metadata is checked against the cluster, configuration,
+sender, receiver, and embedded protocol identities. Transfers use bounded
+chunks and integrity checks; a transport receipt is not a quorum vote.
+Peer relays reuse connections and isolate an unavailable peer from healthy
+peer progress. Storage failure poisons authority before further messages.
+
+Generate **synthetic development-only** certificates in a new directory:
+
+```sh
+go -C tools run ./certs --out /path/to/new-private-test-pki --cluster-id 42 --members 1,2,3
+```
+
+The TLS three-voter case verifies replication, one unavailable voter, and
+quorum-loss fencing. This is bounded one-host evidence, not multi-host HA or
+production qualification. Learner activation, dynamic configuration
+transitions, transfer, native recovery, full tooling and long fault/performance
+qualification remain pending and block broader claims.
+
 `/version` distinguishes the etcd protocol profile from the actual Etcqlite
 version, commit, and dirty-build status. Response headers carry real persisted
 cluster/member IDs and the local execution epoch.

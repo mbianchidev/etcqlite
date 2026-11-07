@@ -3,10 +3,11 @@
 An experimental etcd v3-compatible store backed by SQLite, with a non-Raft
 clustered mode and integrations with Porto and sql-not-so-lite.
 
-**Private, local prototype.** Native gRPC/HTTP KV, watches, leases, auth,
+**Private, experimental prototype.** Native gRPC/HTTP KV, watches, leases, auth,
 Lock/Election helpers, deterministic SQLite state, protocol fault spikes,
-and an offline snapshot converter are runnable. Clustered serving,
-administration, and qualification are still being implemented. GitHub Actions remains
+and an offline snapshot converter are runnable. Static non-Raft quorum serving
+has bounded three-node evidence. Dynamic administration, full recovery and
+qualification are still being implemented. GitHub Actions remains
 disabled. No production, full-compatibility, or performance claim is made.
 
 ## Development and scope
