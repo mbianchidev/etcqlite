@@ -115,6 +115,22 @@ contract. Sustainable capacity sweeps, five alternating paired samples, full
 fault/history checks and topology disclosure remain required; one successful
 probe does not meet the faster/production gate.
 
+The first pinned three-voter Linux reference sample completed 300.35 seconds
+of warmup and 900.37 seconds of measurement at 5,352.58 operations/second.
+Its per-operation p99 was 37.11-48.32 milliseconds. It nevertheless **failed**:
+six measured requests errored, with zero warmup or watch errors. The report
+retains that failure and must not be used as qualified capacity or a successful
+paired sample. All voters subsequently agreed on HashKV 210,323,461 at revision
+2,114,858; no quota alarm was active. Peak process RSS stayed below 3.3 GiB
+and service memory accounting below 4.7 GiB, within the original budget.
+
+The reference emitted slow-apply/read-index warnings and changed election term
+from 2 to 8. Exact request-error details were not captured by the original
+performance runner, so the six errors remain unexplained rather than attributed
+to a convenient infrastructure cause. Its observed rate is far above the
+candidate's first sample; no speed advantage or passing latency gate exists.
+The reference directories and failed report are retained.
+
 ## Bounded external histories
 
 `tools/qualification --correctness` uses pinned Porcupine v1.3.1 models for
@@ -162,6 +178,16 @@ go -C tools run ./qualification --check-history ./new-history.jsonl
 Namespace reuse and output overwrite are refused. The console reports uncertain
 operation counts explicitly. A successful finite check is not an availability
 or performance result, and does not inject or qualify any faults by itself.
+
+A fresh frozen-Linux smoke run then exposed a producer bug: retained replay
+could synchronously fill its 16-frame output queue before a healthy receiver
+had a chance to run. The 512-operation history was retained as failed rather
+than forgiving the missing watch events. Watch delivery now awaits bounded
+queue space, yielding to the receiver; a five-second sustained stall still
+terminates explicitly. Queue/frame limits, revision order and complete-revision
+semantics remain unchanged. Closed receivers and oversized frames remain
+explicit errors. Long campaigns must use the corrected binary, not silently
+overwrite or reinterpret the failed `1fec3e7` trace.
 
 **No CI is authorized.** Run future checks manually in isolated development
 workspaces after implementation is requested. Do not enable Actions or add
