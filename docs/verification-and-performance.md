@@ -239,6 +239,20 @@ so standard client reconnection can replay retained history. Permanent auth,
 compaction and corruption failures keep their explicit terminal semantics.
 The failed run remains failed; a new bounded acceptance and campaign are required.
 
+Frozen clean Linux build `b0e5c0d` then restarted the same three preserved voter
+directories normally, retaining cluster/member identities and all promises.
+Before new writes, all replicas still agreed on HashKV 1,590,436,642 at revision
+129,747. A new healthy trace recorded 512 operations, 271 watch events and two
+reconnects over 26.00 seconds with no uncertain outcomes. The coupled short run
+recorded 2,560 operations, 1,338 watch events and ten reconnects over 134.67
+seconds, with four verified two-second pauses across all three voters. Both
+finite oracles and strict offline rechecks passed. One append deadline remained
+uncertain; it was retained, not classified as an abort or a healthy-availability
+pass. All replicas subsequently agreed on HashKV 1,228,291,493 at revision
+131,050. Process VmHWM stayed below 25 MiB; peer relay overload/retransmission
+warnings remain an unresolved operational/performance concern. This is bounded
+recovery/reconnect evidence, not six-hour completion or comparative capacity.
+
 ### Coupled process-pause driver
 
 `scripts/qualification_campaign.py` launches the collector as its own child and
