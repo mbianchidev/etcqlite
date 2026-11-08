@@ -155,8 +155,8 @@ checks every retained entry. The runtime now caches that statement; all
 cardinality, boundary, checksum and transaction/durability checks remain.
 Regression tests bound SQLite VM work and still reject missing/misbounded logs
 and isolate configuration epochs. This is a query microprofile, not distributed
-capacity or a speed advantage. The running `c09d916` campaign remains frozen
-and was not replaced with this later optimization.
+capacity or a speed advantage. The failed `c09d916` campaign used its frozen
+binary and was not replaced with this later optimization.
 
 ## Bounded external histories
 
@@ -238,6 +238,78 @@ ResourceExhausted read failures now terminate the RPC with their actual status,
 so standard client reconnection can replay retained history. Permanent auth,
 compaction and corruption failures keep their explicit terminal semantics.
 The failed run remains failed; a new bounded acceptance and campaign are required.
+
+### Coupled process-pause driver
+
+`scripts/qualification_campaign.py` launches the collector as its own child and
+checks its exit status at least once per second and again before each pause.
+There is no independent fault driver left running after collector failure.
+A driver failure or SIGINT/SIGTERM stops only that owned child, first with a
+ten-second graceful wait, then a ten-second bounded forced wait if necessary.
+The guest command validates the active unit's MainPID, process owner, birth
+ticks, executable SHA256 and exact `--data-dir` argument before STOP and CONT.
+An EXIT/HUP/INT/TERM trap resumes that same verified process after an interrupted
+pause. Never use this driver against an existing workload or an unapproved VM.
+
+Prepare a new private JSON profile from the actual running fixture identities:
+
+```json
+{
+  "status": "prepared",
+  "production_claim": false,
+  "candidate": "<full-lowercase-40-hex-source-commit>",
+  "linux_binary_sha256": "<full-lowercase-64-hex-executable-sha256>",
+  "requested_seconds": 21600,
+  "fault_interval_seconds": 180,
+  "fault_pause_seconds": 2,
+  "seed": 5001,
+  "concurrency": 16,
+  "unit": "etcqlite-qual-fixture.service",
+  "data_relative_path": "etcqlite-qualification/fixture/node",
+  "executable_relative_path": "etcqlite-qualification/runtime-frozen/etcqlite",
+  "nodes": [
+    {"vm": "etcqlite-qual-fixture-1", "pid": 101, "birth_ticks": 201},
+    {"vm": "etcqlite-qual-fixture-2", "pid": 102, "birth_ticks": 202},
+    {"vm": "etcqlite-qual-fixture-3", "pid": 103, "birth_ticks": 203}
+  ]
+}
+```
+
+Replace every example identity, path and hash; use a never-used seed and new
+history/fault-log paths. The profile is limited to 64 KiB, rejects duplicate
+fields/nonstandard numbers and validates scalar types and path components.
+If present, `status` must be `prepared`, not an existing failed or active run.
+VM name prefixes and `--owned-fixture` attest the operator's explicit
+authorization; discovering a profile is not permission to run it.
+Python 3 and Porto must already be installed; the Python driver uses only the
+standard library. Build the existing Go collector first:
+
+```sh
+go -C tools build -o ../target/tools/etcqlite-qualification ./qualification
+make test-campaign
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/qualification_campaign.py \
+  --profile ./private/new-profile.json --owned-fixture \
+  --qualifier ./target/tools/etcqlite-qualification \
+  --history ./private/new-history.jsonl --fault-log ./private/new-fault.jsonl \
+  --endpoints https://node1:2379,https://node2:2379,https://node3:2379 \
+  --ca ./fixture-ca.crt --cert ./fixture-client.crt --key ./fixture-client.key
+```
+
+The next pause is scheduled one interval after the preceding pause completes;
+delays never cause catch-up bursts. At the requested deadline no further pauses
+start, and the collector has at most 300 seconds to finish its current bounded
+epoch. A successful collector exit still requires the strict offline history
+recheck, with a 900-second total deadline, before recording completion.
+Fault evidence is exclusively created mode 0600 and flushed/fsynced per record.
+Failed or interrupted evidence is never removed or overwritten.
+
+An unplanned control-loop gap over five seconds, a backwards monotonic step,
+or wall/monotonic elapsed disagreement over five seconds fails clock continuity
+and terminates the run as interrupted. The explicitly bounded guest pause can
+occupy at most twenty seconds; it does not waive wall/monotonic continuity.
+Host suspend or clock changes must not be turned into claimed qualification
+time. This policy does not change laptop power settings or clocks, and a short
+driver acceptance is not a six-hour or production gate.
 
 **No CI is authorized.** Run future checks manually in isolated development
 workspaces after implementation is requested. Do not enable Actions or add

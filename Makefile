@@ -4,7 +4,7 @@ export ETCQLITE_BUILD_SHA
 ETCQLITE_BUILD_DIRTY := $(if $(shell git status --porcelain --untracked-files=normal),true,false)
 export ETCQLITE_BUILD_DIRTY
 
-.PHONY: build install test fmt lint audit conformance
+.PHONY: build install test test-campaign fmt lint audit conformance
 
 build:
 	cargo build --release --locked
@@ -18,6 +18,10 @@ install:
 test:
 	cargo test --locked
 	go -C tools test ./...
+	$(MAKE) test-campaign
+
+test-campaign:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_qualification_campaign.py
 
 fmt:
 	cargo fmt --all --check
