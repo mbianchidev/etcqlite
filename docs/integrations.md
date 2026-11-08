@@ -6,7 +6,8 @@ integration worktrees are implemented experimentally.
 lifecycle and new-k3s selection;
 [mbianchidev/sql-not-so-lite#75](https://github.com/mbianchidev/sql-not-so-lite/pull/75)
 adds opt-in catalog/inspector projections and protected-store exclusion.
-Both remain draft delivery, not production or complete k3s qualification.
+Both integration PRs were merged on 2026-11-07 after their existing CI passed.
+This does not establish production or complete k3s qualification.
 No primary checkout or existing workload is retargeted.
 
 ## Implemented service contract
@@ -172,5 +173,6 @@ Discovery alone never authorizes installation, startup, mutation, or restore.
 | Local three-node demo | Clearly labeled one-host experimentation, not host-level HA |
 
 Work in Porto and sql-not-so-lite uses their own separately authorized focused
-branches and draft PRs. Merge, existing-workload migration and CI enablement in
-Etcqlite remain unauthorized.
+branches. The integration PRs are merged; the Etcqlite implementation PR remains
+draft. Existing-workload migration, production deployment, CI enablement and
+merging the Etcqlite PR remain unauthorized.

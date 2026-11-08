@@ -57,6 +57,34 @@ hash scans now use a pinned read-only WAL view off the writer and accelerated
 Castagnoli CRC with the same reference encoding. Large-tool calls still need
 an appropriate client deadline; the exact primary and recovery gates remain open.
 
+The first complete primary candidate sample at
+`1fec3e7f43c73826f9a88f0479fcb2ed2f536b5f` passed the original resource limits:
+100,000 live keys, 1,000,000 seeded mutations, 100 prefix watches and 32 client
+workers. Actual warmup was 311.33 seconds and measurement 927.31 seconds, with
+zero request, warmup or watch errors. Throughput was 55.65 operations/second;
+per-operation p99 was approximately 1.69-1.88 seconds. Each server's observed
+VmHWM stayed below 25 MiB. The prior OOM result remains retained.
+
+All three replicas subsequently agreed on the exact retained-history HashKV
+value at revision 34,934. A live native image of 5,907,914,784 bytes was captured
+and fully verified, then translated into a 2,414,034,944-byte bbolt image accepted
+by pinned etcdutl v3.7.3 and a private disk-backed interchange. Subsequent fresh
+native and real upstream restores agreed on HashKV 1,758,762,700 at revision
+35,154. Native import took 18.13 seconds and 25,472 KiB peak RSS.
+
+The real upstream destination then accepted binary, delete/recreate, lease and
+auth changes. After fencing it, a new snapshot and disk-backed reverse import
+retained all 100,087 live synthetic keys and exact historical/generation, auth
+and lease assertions. Native and upstream HashKV agreed at 1,974,551,075,
+revision 35,159 and compact revision -1. Reverse import took 16.45 seconds and
+25,472 KiB peak RSS. Both new native images were fully verified and retained.
+This establishes one large isolated application cutover and post-write rollback,
+not a complete RPO/RTO campaign, multi-voter recovery qualification or speed win.
+
+The candidate report retained only two server-version strings due to a reporting
+bug; live discovery/status separately verified all three exact candidate
+identities. The reporting bug is fixed in the subsequent tooling work.
+
 The `tools/qualification` runner seeds synthetic 64-byte keys/1024-byte values
 through durable API transactions, starts fixed prefix watches, and issues exact
 100-operation cycles with the frozen 60/10/20/10 mix. It records exact per-operation
@@ -86,6 +114,54 @@ predeclared retained-history dataset without changing the durability/read
 contract. Sustainable capacity sweeps, five alternating paired samples, full
 fault/history checks and topology disclosure remain required; one successful
 probe does not meet the faster/production gate.
+
+## Bounded external histories
+
+`tools/qualification --correctness` uses pinned Porcupine v1.3.1 models for
+register/CAS, atomic two-key read/write, append and set operations. It records
+bounded 512-operation epochs across 16 independent groups with at most 32 workers.
+Timed-out writes remain uncertain, including possible later committed effects;
+they are never silently treated as aborted. Unary SDK calls make one attempt,
+so a successful response cannot hide replayed mutations. Logical append still
+uses explicit compare-and-swap attempts within its bounded request deadline.
+
+The separate watch oracle checks revision order, duplicates, exact previous KV,
+create/version/delete metadata, every acknowledged mutation, and explanations
+for observed uncertain effects. Successful reads and no-op outcomes must agree
+with the watch replay at their reported revision. The final range is pinned by
+its fence revision; later observed pending effects are retained rather than
+discarded. Reconnection occurs only after a complete response, never midway
+through an atomic revision.
+
+Private format-2 JSONL records preserve requested and actual monotonic timing,
+operations, watch evidence, transient interruptions, epoch checks and terminal
+completion/failure. Rechecking rejects unknown/duplicate/null fields, missing
+required fields, wrong array shapes, nonprivate or changing files, missing or
+repeated epochs/checks, and trailing records. Limits are 8 MiB per record and
+16 GiB per streamed file; capture enforces them too. Every epoch has a 30-second
+external-check deadline. An `Unknown` result is failure, not a pass.
+
+A real three-voter host-local smoke trace recorded 512 operations, 267 watch
+events and two reconnects. Both independent oracles accepted the finite trace,
+with 12 deadline-exceeded outcomes retained as uncertain (11 append, one CAS).
+The installed host build was labeled dirty. This checks the tooling, including
+uncertainty; it is not a healthy availability, Linux fault campaign, or
+production qualification result. Legacy format-1 probe evidence remains retained
+but is not accepted by the stronger format-2 rechecker.
+
+```sh
+GOMAXPROCS=2 go -C tools run ./qualification --correctness \
+  --endpoints https://node1:2379,https://node2:2379,https://node3:2379 \
+  --ca ./fixture-ca.crt --cert ./fixture-client.crt --key ./fixture-client.key \
+  --engine <exact-build> --seed 1002 --concurrency 16 --duration 10m \
+  --output ./new-history.jsonl --owned-fixture
+
+go -C tools run ./qualification --check-history ./new-history.jsonl
+```
+
+Namespace reuse and output overwrite are refused. The console reports uncertain
+operation counts explicitly. A successful finite check is not an availability
+or performance result, and does not inject or qualify any faults by itself.
 
 **No CI is authorized.** Run future checks manually in isolated development
 workspaces after implementation is requested. Do not enable Actions or add

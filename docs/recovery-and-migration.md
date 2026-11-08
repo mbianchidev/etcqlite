@@ -2,7 +2,9 @@
 
 Status: native backup/restore, verified member join, schema up/down migration and
 both-direction application interchange are implemented experimentally. Nothing
-here authorizes a live cutover or restore. Large-dataset and multi-host recovery
+here authorizes a production cutover or restore. One isolated multi-GiB
+application cutover and post-write reverse restore passed on the owned Linux
+fixtures. Multi-host recovery, failure campaigns and complete RPO/RTO
 qualification remain pending.
 
 ## Runnable offline operations
@@ -94,8 +96,8 @@ Backend Hash and HashKV scans share the bounded pinned-reader admission and do
 not hold up protocol ticks or client mutations. Read views retain a duplicate
 of the owned lock descriptor until completion. For large histories, set an
 explicit client deadline, for example `etcdctl --command-timeout=60s endpoint hashkv`.
-This implementation removes the JSON-history limitation, not the remaining
-large-dataset recovery, RPO/RTO or fault qualification gates.
+This implementation removes the JSON-history limitation. The measured large
+application round trip below does not close RPO/RTO or fault qualification.
 
 `--fenced-source` is an operator attestation, not software that fences a remote
 cluster. Before destination writes, retain the unchanged fenced source. After
@@ -105,6 +107,30 @@ into a new isolated authority; never repoint clients to the stale source.
 Lease checkpoints are honored on restart; absent checkpoints use the granted-TTL
 extension policy. Tokens must be reacquired. Revision bump/compaction is explicit
 and invalidates old watch caches; it is not a counter reset.
+
+## Measured large application round trip
+
+The frozen `1fec3e7` Linux candidate's fully verified 5,907,914,784-byte native
+image was translated to a pinned etcd v3.7.3 bbolt image. Disk-backed import into
+a fresh native authority retained revision 35,154 and compact revision -1;
+native and upstream HashKV both returned 1,758,762,700. Native import took
+18.13 seconds with 25,472 KiB peak RSS. Upstream restore used a separate fresh
+authority, not the stopped original voter directories.
+
+After actual upstream destination writes, its verified snapshot was staged and
+reverse-imported into a third new native authority. Both destination and reverse
+restore returned HashKV 1,974,551,075 at revision 35,159. All 100,087 live synthetic
+keys were retained, along with a binary NUL/0xff value, the deleted/recreated key's
+history and generation counters, password-authenticated root access and auth
+revision 4, and the same lease ID, granted TTL and key ownership. Reverse import
+took 16.45 seconds with 25,472 KiB peak RSS. Native images from both restored
+authorities were independently integrity-checked and retained privately.
+
+These are measured component timings, not end-to-end RTO or a multi-voter
+disaster recovery claim. Source writers stayed stopped, no stale source was
+retargeted, and no production workload participated. The ordinary no-checkpoint
+granted-TTL extension policy was used. See [qualification](verification-and-performance.md)
+for the remaining gates.
 
 ## Joining and replacing a member
 

@@ -8,10 +8,12 @@ Lock/Election helpers, deterministic SQLite state, protocol fault spikes,
 and an offline snapshot converter are runnable. Dynamic non-Raft membership,
 learner bootstrap/promotion, leadership transfer, Maintenance, native recovery,
 reversible application translation, and read-only integration endpoints now
-have bounded synthetic evidence. Opt-in Porto and sql-not-so-lite wiring is
-implemented in approved draft PRs. Production/performance qualification remains
-open, including a failed Linux memory gate. GitHub Actions remains
-disabled. No production, full-compatibility, or performance claim is made.
+have bounded synthetic evidence, including a multi-GiB application cutover and
+post-write reverse restore. Opt-in Porto and sql-not-so-lite wiring is merged
+in the approved integration repositories. The first full Linux candidate sample
+passed its resource gate; comparative performance and long fault qualification
+remain open. The earlier OOM evidence is retained. GitHub Actions remains
+disabled. No production, full-compatibility, or speed claim is made.
 
 ## Development and scope
 

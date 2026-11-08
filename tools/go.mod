@@ -3,6 +3,7 @@ module github.com/mbianchidev/etcqlite/tools
 go 1.26.0
 
 require (
+	github.com/anishathalye/porcupine v1.3.1
 	go.etcd.io/bbolt v1.5.0
 	go.etcd.io/etcd/api/v3 v3.7.3
 	go.etcd.io/etcd/client/v3 v3.7.3

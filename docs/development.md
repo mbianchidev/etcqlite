@@ -12,7 +12,7 @@ target/release/etcqlite init --data-dir ./local-node --name local
 target/release/etcqlite serve --data-dir ./local-node --listen 127.0.0.1:2379
 ```
 
-Initialization is explicit and refuses nonempty data directories. Restart
+Initialization is explicit and refuses nonempty data directories.
 An explicitly supplied `init --quota-bytes <positive-bytes>` persists the logical
 MVCC quota on a fresh node; it is not an online quota change. The default remains
 2 GiB. Qualification uses equal explicitly configured quota limits for candidate

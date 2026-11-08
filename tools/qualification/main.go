@@ -34,6 +34,8 @@ type options struct {
 	warmup, duration                         time.Duration
 	seed                                     int64
 	owned                                    bool
+	correctness                              bool
+	checkHistory                             string
 }
 
 type latency struct {
@@ -93,11 +95,56 @@ func main() {
 	flag.DurationVar(&o.duration, "duration", 15*time.Minute, "measured steady state")
 	flag.Int64Var(&o.seed, "seed", 42, "synthetic workload seed")
 	flag.BoolVar(&o.owned, "owned-fixture", false, "attest endpoints are isolated owned synthetic fixtures")
+	flag.BoolVar(&o.correctness, "correctness", false, "collect bounded synthetic external histories instead of primary performance")
+	flag.StringVar(&o.checkHistory, "check-history", "", "check a previously captured private synthetic history without contacting servers")
 	flag.Parse()
-	if err := run(o); err != nil {
+	var err error
+	switch {
+	case o.checkHistory != "":
+		err = checkHistoryFile(o.checkHistory)
+	case o.correctness:
+		err = runCorrectness(o)
+	default:
+		err = run(o)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "qualification:", err)
 		os.Exit(1)
 	}
+}
+
+func fixtureClient(o options) (*clientv3.Client, error) {
+	endpoints := strings.Split(o.endpoints, ",")
+	if len(endpoints) != 3 {
+		return nil, errors.New("qualification requires exactly three HTTPS endpoints")
+	}
+	for _, endpoint := range endpoints {
+		if !strings.HasPrefix(endpoint, "https://") {
+			return nil, errors.New("qualification never weakens the TLS posture")
+		}
+	}
+	certificate, err := tls.LoadX509KeyPair(o.cert, o.key)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(o.ca)
+	if err != nil {
+		return nil, err
+	}
+	ca := x509.NewCertPool()
+	if !ca.AppendCertsFromPEM(data) {
+		return nil, errors.New("invalid fixture CA")
+	}
+	config := clientv3.Config{
+		Endpoints: endpoints, DialTimeout: 5 * time.Second,
+		TLS:         &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: ca, Certificates: []tls.Certificate{certificate}},
+		DialOptions: []grpc.DialOption{grpc.WithNoProxy()}, Logger: zap.NewNop(),
+	}
+	if o.correctness {
+		config.MaxUnaryRetries = 1
+		config.MaxCallRecvMsgSize = maxHistoryRecordBytes
+	}
+	return clientv3.New(config)
 }
 
 func operation(index int) string {
@@ -163,23 +210,7 @@ func run(o options) (result error) {
 	}()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	certificate, err := tls.LoadX509KeyPair(o.cert, o.key)
-	if err != nil {
-		return err
-	}
-	data, err := os.ReadFile(o.ca)
-	if err != nil {
-		return err
-	}
-	ca := x509.NewCertPool()
-	if !ca.AppendCertsFromPEM(data) {
-		return errors.New("invalid fixture CA")
-	}
-	client, err := clientv3.New(clientv3.Config{
-		Endpoints: endpoints, DialTimeout: 5 * time.Second,
-		TLS:         &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: ca, Certificates: []tls.Certificate{certificate}},
-		DialOptions: []grpc.DialOption{grpc.WithNoProxy()}, Logger: zap.NewNop(),
-	})
+	client, err := fixtureClient(o)
 	if err != nil {
 		return err
 	}
@@ -193,9 +224,9 @@ func run(o options) (result error) {
 		if err != nil {
 			return fmt.Errorf("fixture status: %w", err)
 		}
-		r.ServerVersions = versions
 		versions = append(versions, status.Version)
 	}
+	r.ServerVersions = versions
 	call, done := context.WithTimeout(ctx, 10*time.Second)
 	existing, err := client.Get(call, namespace, clientv3.WithPrefix(), clientv3.WithCountOnly())
 	done()
