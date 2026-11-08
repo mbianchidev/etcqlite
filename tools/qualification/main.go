@@ -62,6 +62,9 @@ type report struct {
 	Errors          int64              `json:"errors"`
 	WarmupErrors    int64              `json:"warmup_errors"`
 	WatchErrors     int64              `json:"watch_errors"`
+	ErrorDetails    []requestError     `json:"error_details"`
+	WarmupDetails   []requestError     `json:"warmup_error_details"`
+	WatchDetails    []requestError     `json:"watch_error_details"`
 	PerOperation    map[string]latency `json:"per_operation"`
 	ServerVersions  []string           `json:"server_versions"`
 	ClientOS        string             `json:"client_os"`
@@ -188,17 +191,20 @@ func run(o options) (result error) {
 		return err
 	}
 	r := report{
-		Format: 1, Engine: o.engine, Seed: o.seed, Keys: o.keys, Mutations: o.mutations,
+		Format: 2, Engine: o.engine, Seed: o.seed, Keys: o.keys, Mutations: o.mutations,
 		KeyBytes: 64, ValueBytes: 1024, Concurrency: o.concurrency, PerOperation: make(map[string]latency),
+		ErrorDetails: []requestError{}, WarmupDetails: []requestError{}, WatchDetails: []requestError{},
 		ClientOS: runtime.GOOS, ClientArch: runtime.GOARCH, ClientMaxProcs: runtime.GOMAXPROCS(0),
 		Consistency: "durable-quorum/default-linearizable", SampleLimit: maxLatencySamples,
 		WatchShape: "100 disjoint prefixes covering 10% of 100000 keys in the primary shape",
 		Phase:      "tls", StartedAt: time.Now().UTC(),
 	}
-	var watchErrors atomic.Int64
+	var watchEvidence errorEvidence
+	var watchCaptureMu sync.Mutex
+	var watchCaptureError error
 	defer func() {
 		r.EndedAt = time.Now().UTC()
-		r.WatchErrors = watchErrors.Load()
+		r.WatchErrors, r.WatchDetails = watchEvidence.snapshot()
 		if result != nil {
 			r.Failure = result.Error()
 		}
@@ -254,7 +260,22 @@ func run(o options) (result error) {
 		r.SeededMutations = start
 	}
 	var watchWG sync.WaitGroup
-	defer func() { cancel(); watchWG.Wait() }()
+	defer func() {
+		cancel()
+		watchWG.Wait()
+		watchCaptureMu.Lock()
+		result = errors.Join(result, watchCaptureError)
+		watchCaptureMu.Unlock()
+	}()
+	watchStarted := time.Now()
+	recordWatchError := func(failure error) {
+		if err := watchEvidence.record("watch", failure, time.Since(watchStarted).Nanoseconds()); err != nil {
+			watchCaptureMu.Lock()
+			watchCaptureError = errors.Join(watchCaptureError, err)
+			watchCaptureMu.Unlock()
+			cancel()
+		}
+	}
 	watchCount := 100
 	if o.keys < 100_000 {
 		watchCount = max(1, o.keys/1_000)
@@ -269,39 +290,46 @@ func run(o options) (result error) {
 			for response := range stream {
 				if response.Err() != nil {
 					if ctx.Err() == nil {
-						watchErrors.Add(1)
+						recordWatchError(response.Err())
 					}
 					return
 				}
 				for _, event := range response.Events {
+					if event == nil || event.Kv == nil {
+						recordWatchError(errors.New("watch returned an invalid event shape"))
+						return
+					}
 					if event.Kv.ModRevision < revision {
-						watchErrors.Add(1)
+						recordWatchError(fmt.Errorf("watch revision regressed from %d to %d", revision, event.Kv.ModRevision))
 					}
 					revision = event.Kv.ModRevision
 				}
+			}
+			if ctx.Err() == nil {
+				recordWatchError(errors.New("watch stream ended without cancellation"))
 			}
 		}()
 	}
 	r.Phase = "warmup"
 	if o.warmup > 0 {
-		_, failures, elapsed, err := workload(ctx, client, o, o.warmup, false)
-		r.WarmupErrors, r.WarmupSeconds = failures, elapsed.Seconds()
+		warmup, err := workload(ctx, client, o, o.warmup, false)
+		r.WarmupErrors, r.WarmupSeconds, r.WarmupDetails = warmup.Errors, warmup.Elapsed.Seconds(), warmup.ErrorDetails
 		if err != nil {
 			return err
 		}
 	}
 	r.Phase = "measurement"
-	samples, failures, elapsed, err := workload(ctx, client, o, o.duration, true)
-	r.Errors, r.MeasuredSeconds = failures, elapsed.Seconds()
+	measured, err := workload(ctx, client, o, o.duration, true)
+	r.Errors, r.MeasuredSeconds, r.ErrorDetails = measured.Errors, measured.Elapsed.Seconds(), measured.ErrorDetails
 	cancel()
 	watchWG.Wait()
 	var count int
-	for name, values := range samples {
+	for name, values := range measured.Samples {
 		count += len(values)
 		r.PerOperation[name] = percentile(values)
 	}
-	if elapsed > 0 {
-		r.Throughput = float64(count) / elapsed.Seconds()
+	if measured.Elapsed > 0 {
+		r.Throughput = float64(count) / measured.Elapsed.Seconds()
 	}
 	if err != nil {
 		return fmt.Errorf("incomplete measurement retained: %w", err)
@@ -310,13 +338,21 @@ func run(o options) (result error) {
 	r.Phase = "complete"
 	r.PrimaryShape = o.keys == 100_000 && o.mutations == 1_000_000 && watchCount == 100 &&
 		r.WarmupSeconds >= (5*time.Minute).Seconds() && r.MeasuredSeconds >= (15*time.Minute).Seconds()
-	if failures != 0 || watchErrors.Load() != 0 || r.WarmupErrors != 0 {
-		return fmt.Errorf("qualification retained failed evidence: request errors=%d, warmup errors=%d, watch errors=%d", failures, r.WarmupErrors, watchErrors.Load())
+	watchErrors, _ := watchEvidence.snapshot()
+	if measured.Errors != 0 || watchErrors != 0 || r.WarmupErrors != 0 {
+		return fmt.Errorf("qualification retained failed evidence: request errors=%d, warmup errors=%d, watch errors=%d", measured.Errors, r.WarmupErrors, watchErrors)
 	}
 	return nil
 }
 
-func workload(ctx context.Context, client *clientv3.Client, o options, duration time.Duration, record bool) (map[string][]int64, int64, time.Duration, error) {
+type workloadResult struct {
+	Samples      map[string][]int64
+	Errors       int64
+	ErrorDetails []requestError
+	Elapsed      time.Duration
+}
+
+func workload(ctx context.Context, client clientv3.KV, o options, duration time.Duration, record bool) (workloadResult, error) {
 	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -324,7 +360,8 @@ func workload(ctx context.Context, client *clientv3.Client, o options, duration 
 	deadline := start.Add(duration)
 	var mu sync.Mutex
 	samples := map[string][]int64{"range": {}, "prefix-range": {}, "put": {}, "cas": {}}
-	var failures, count atomic.Int64
+	var evidence errorEvidence
+	var count atomic.Int64
 	var fatal error
 	var workers sync.WaitGroup
 	for worker := 0; worker < o.concurrency; worker++ {
@@ -365,16 +402,22 @@ func workload(ctx context.Context, client *clientv3.Client, o options, duration 
 							err = errors.New("CAS rejected the seeded synthetic value")
 						}
 					}
+					latencyNS := time.Since(begin).Nanoseconds()
 					done()
 					if err != nil {
-						failures.Add(1)
+						if captureError := evidence.record(name, err, time.Since(start).Nanoseconds()); captureError != nil {
+							mu.Lock()
+							fatal = errors.Join(fatal, captureError)
+							mu.Unlock()
+							cancel()
+						}
 					}
 					if record {
 						mu.Lock()
 						if count.Add(1) <= maxLatencySamples {
-							samples[name] = append(samples[name], time.Since(begin).Nanoseconds())
+							samples[name] = append(samples[name], latencyNS)
 						} else {
-							fatal = errors.New("exact latency sample capacity exceeded; no sampled percentile claim is emitted")
+							fatal = errors.Join(fatal, errors.New("exact latency sample capacity exceeded; no sampled percentile claim is emitted"))
 							cancel()
 						}
 						mu.Unlock()
@@ -387,7 +430,8 @@ func workload(ctx context.Context, client *clientv3.Client, o options, duration 
 	if fatal != nil {
 		samples = nil
 	}
-	return samples, failures.Load(), time.Since(start), errors.Join(fatal, parent.Err())
+	failures, details := evidence.snapshot()
+	return workloadResult{Samples: samples, Errors: failures, ErrorDetails: details, Elapsed: time.Since(start)}, errors.Join(fatal, parent.Err())
 }
 
 func percentile(values []int64) latency {

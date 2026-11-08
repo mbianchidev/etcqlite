@@ -42,11 +42,11 @@ func TestExactPercentilesDoNotHideTailLatency(t *testing.T) {
 func TestCancellationStopsBeforeIssuingAnotherRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	samples, failures, _, err := workload(ctx, nil, options{concurrency: 4}, time.Minute, true)
-	if !errors.Is(err, context.Canceled) || failures != 0 {
-		t.Fatalf("cancelled workload fabricated requests: failures=%d error=%v", failures, err)
+	result, err := workload(ctx, nil, options{concurrency: 4}, time.Minute, true)
+	if !errors.Is(err, context.Canceled) || result.Errors != 0 {
+		t.Fatalf("cancelled workload fabricated requests: failures=%d error=%v", result.Errors, err)
 	}
-	for _, values := range samples {
+	for _, values := range result.Samples {
 		if len(values) != 0 {
 			t.Fatal("cancelled workload recorded nonexistent operations")
 		}

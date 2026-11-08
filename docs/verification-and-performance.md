@@ -101,6 +101,21 @@ without publishing truncated percentiles. Only completed runs with the actual
 primary timing can carry the primary-shape flag. This is evidence retention,
 not an external linearizability checker.
 
+New performance reports use format 2 and include separate `error_details`,
+`warmup_error_details` and `watch_error_details` arrays. Each entry retains the
+operation, terminal gRPC/status code, exact message, count, and first/last
+monotonic nanoseconds relative to that phase's start. Local response-validation
+failures remain explicit `Unknown` errors rather than being reclassified as
+transport failures. These are terminal logical-RPC outcomes, not a claim to
+capture every SDK retry attempt.
+
+Evidence is bounded to 128 distinct entries per phase and 4,096 bytes per message.
+Exceeding either bound fails the run explicitly and suppresses incomplete
+percentiles; errors are not silently dropped or truncated. The five-second
+request deadline and frozen workload/mix remain unchanged. Legacy format-1
+reports are retained as captured; their missing error details are not fabricated
+after the fact.
+
 ```sh
 GOMAXPROCS=2 go -C tools run ./qualification \
   --endpoints https://node1:2379,https://node2:2379,https://node3:2379 \
