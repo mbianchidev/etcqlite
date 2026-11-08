@@ -28,6 +28,11 @@ pub enum StorageError {
 
 type Result<T> = std::result::Result<T, StorageError>;
 
+const RETAINED_LOG_BOUNDS_SQL: &str = "SELECT
+        (SELECT COUNT(*) FROM protocol_entries WHERE configuration_id = ?1),
+        (SELECT MIN(log_idx) FROM protocol_entries WHERE configuration_id = ?1),
+        (SELECT MAX(log_idx) FROM protocol_entries WHERE configuration_id = ?1)";
+
 pub(crate) fn verify_database(connection: &Connection) -> Result<()> {
     let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'protocol_state')", [], |row| row.get(0))?;
     if !exists {
@@ -518,12 +523,9 @@ fn validate_state(connection: &Connection, config: u32, state: &State) -> Result
         .checked_add(i64::from(state.stopsign.is_some()))
         .ok_or_else(|| StorageError::Invariant("accepted position exhausted".into()))?;
     ensure(state.decided <= accepted, "decision exceeds accepted log")?;
-    let (count, first, last): (i64, Option<i64>, Option<i64>) = connection.query_row(
-        "SELECT COUNT(*), MIN(log_idx), MAX(log_idx) FROM protocol_entries
-         WHERE configuration_id = ?1",
-        [config],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+    let (count, first, last): (i64, Option<i64>, Option<i64>) = connection
+        .prepare_cached(RETAINED_LOG_BOUNDS_SQL)?
+        .query_row([config], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
     ensure(
         count == state.end - state.compacted,
         "retained log length mismatch",
@@ -580,4 +582,94 @@ fn entry_digest(config: u32, index: i64, payload: &[u8]) -> Vec<u8> {
     digest.update(index.to_be_bytes());
     digest.update(payload);
     digest.finalize().to_vec()
+}
+
+#[cfg(test)]
+mod validation_query_tests {
+    use super::*;
+    use rusqlite::StatementStatus;
+
+    fn fixture() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE protocol_entries (
+                configuration_id INTEGER NOT NULL,
+                log_idx INTEGER NOT NULL CHECK(log_idx >= 0),
+                payload BLOB NOT NULL,
+                checksum BLOB NOT NULL,
+                PRIMARY KEY(configuration_id, log_idx)
+             ) STRICT;
+             WITH RECURSIVE positions(i) AS (
+                SELECT 0 UNION ALL SELECT i + 1 FROM positions WHERE i < 4095
+             )
+             INSERT INTO protocol_entries SELECT 1,i,x'00',x'00' FROM positions;
+             WITH RECURSIVE positions(i) AS (
+                SELECT 40 UNION ALL SELECT i + 1 FROM positions WHERE i < 79
+             )
+             INSERT INTO protocol_entries SELECT 2,i,x'00',x'00' FROM positions;",
+            )
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn exact_bounds_use_the_existing_index_without_aggregating_min_max_per_entry() {
+        let connection = fixture();
+        for (config, count, first, last) in [
+            (1, 4096, Some(0), Some(4095)),
+            (2, 40, Some(40), Some(79)),
+            (3, 0, None, None),
+        ] {
+            let mut statement = connection.prepare(RETAINED_LOG_BOUNDS_SQL).unwrap();
+            let actual: (i64, Option<i64>, Option<i64>) = statement
+                .query_row([config], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap();
+            assert_eq!(actual, (count, first, last));
+            let steps = statement.get_status(StatementStatus::VmStep);
+            assert!(
+                i64::from(steps) <= count * 4 + 100,
+                "configuration {config}: {steps} VM steps for {count} entries"
+            );
+        }
+    }
+
+    #[test]
+    fn full_length_and_boundary_corruption_are_still_rejected() {
+        let connection = fixture();
+        let state = State {
+            promise: None,
+            accepted_round: None,
+            decided: 4096,
+            compacted: 0,
+            end: 4096,
+            stopsign: None,
+            snapshot: None,
+        };
+        validate_state(&connection, 1, &state).unwrap();
+        connection
+            .execute(
+                "DELETE FROM protocol_entries WHERE configuration_id=1 AND log_idx=20",
+                [],
+            )
+            .unwrap();
+        assert!(
+            validate_state(&connection, 1, &state)
+                .unwrap_err()
+                .to_string()
+                .contains("retained log length mismatch")
+        );
+        connection
+            .execute(
+                "INSERT INTO protocol_entries VALUES(1,4096,x'00',x'00')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            validate_state(&connection, 1, &state)
+                .unwrap_err()
+                .to_string()
+                .contains("retained log boundary mismatch")
+        );
+    }
 }

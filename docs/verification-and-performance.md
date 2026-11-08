@@ -146,6 +146,18 @@ to a convenient infrastructure cause. Its observed rate is far above the
 candidate's first sample; no speed advantage or passing latency gate exists.
 The reference directories and failed report are retained.
 
+Read-only microprofiling of the verified native image's 154,080 retained protocol
+entries identified avoidable work in each metadata validation. The combined
+`COUNT/MIN/MAX` query took a median 4.70 ms; three exact scalar aggregates in
+one statement took 1.97 ms in alternating warm runs on the same immutable file.
+Separate `MIN`/`MAX` queries use existing index endpoints, while `COUNT` still
+checks every retained entry. The runtime now caches that statement; all
+cardinality, boundary, checksum and transaction/durability checks remain.
+Regression tests bound SQLite VM work and still reject missing/misbounded logs
+and isolate configuration epochs. This is a query microprofile, not distributed
+capacity or a speed advantage. The running `c09d916` campaign remains frozen
+and was not replaced with this later optimization.
+
 ## Bounded external histories
 
 `tools/qualification --correctness` uses pinned Porcupine v1.3.1 models for
