@@ -782,6 +782,87 @@ async fn grpc_watch_replays_then_delivers_live_complete_revisions_and_progress()
 }
 
 #[tokio::test]
+async fn active_watch_writer_timeout_is_an_rpc_error_not_a_cancel_frame() {
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("node");
+    drop(
+        Store::create(
+            &path,
+            Identity {
+                cluster_id: 41,
+                member_id: 42,
+                name: "mock-watch-timeout".into(),
+            },
+        )
+        .unwrap(),
+    );
+    let server = server::start(Options {
+        data_dir: path,
+        address: "127.0.0.1:0".parse().unwrap(),
+        tls: None,
+        request_timeout: Duration::from_millis(100),
+        peer: None,
+        snapshot_tool: None,
+    })
+    .await
+    .unwrap();
+    let mut watcher = pb::watch_client::WatchClient::connect(server.endpoint.clone())
+        .await
+        .unwrap();
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let mut stream = watcher
+        .watch(ReceiverStream::new(receiver))
+        .await
+        .unwrap()
+        .into_inner();
+    sender
+        .send(pb::WatchRequest {
+            request_union: Some(pb::watch_request::RequestUnion::CreateRequest(
+                pb::WatchCreateRequest {
+                    key: b"mock/watch-timeout".to_vec(),
+                    watch_id: 19,
+                    ..Default::default()
+                },
+            )),
+        })
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .created
+    );
+    let runtime = server.runtime.clone();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let busy = tokio::spawn(async move {
+        runtime
+            .maintenance(move |_, _| {
+                started.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(())
+            })
+            .await
+    });
+    ready.await.unwrap();
+    server.runtime.changes.notify_waiters();
+    let failure = tokio::time::timeout(Duration::from_secs(2), stream.message())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(failure.code(), tonic::Code::DeadlineExceeded);
+    assert_eq!(failure.message(), "request deadline exceeded");
+    assert!(busy.await.unwrap().is_err());
+    drop(sender);
+    drop(stream);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn grpc_lock_waits_for_the_current_owner_and_reacquires_with_the_same_lease() {
     use etcqlite::wire::v3lockpb as lock;
 

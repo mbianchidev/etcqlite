@@ -219,12 +219,25 @@ overwrite or reinterpret the failed `1fec3e7` trace.
 The matching clean Linux build at `c09d916` subsequently passed 3,072 mixed
 operations in 10.14 seconds and 29,184 operations over 120.23 seconds while one
 identity-pinned voter was paused/resumed for two seconds. Both finite oracles
-passed with zero uncertain outcomes. The same owned three-voter setup has
-started a requested six-hour seeded process-pause/mixed-history campaign.
-Its result remains **pending**. Requested duration, running processes and
-elapsed conversation time do not establish the six-hour or 24-hour gates.
+passed with zero uncertain outcomes. The same owned three-voter setup attempted
+a six-hour seeded process-pause/mixed-history campaign. It **failed** at epoch
+540 after 540 checked epochs, 276,992 captured operations and 3,674 uncertain
+deadline/cancellation outcomes. The last operation's actual elapsed time was
+12,220.27 seconds, not six hours. An established watch channel closed without
+an error and never caught up to its fenced revision. The failed history and
+fault log were made read-only; further injection was stopped. Neither the
+six-hour nor 24-hour gate passed. Large wall/monotonic and host/guest timestamp
+differences were observed and are not normalized into qualification time.
 This profile does not cover disk/fsync faults, complete/asymmetric partitions,
 lease/auth behavior or reconfiguration failure campaigns.
+
+The native watch path canceled established watches on temporary writer-read
+errors. The pinned official client can close an established cancellation channel
+without surfacing its reason. Retryable Unavailable/DeadlineExceeded/
+ResourceExhausted read failures now terminate the RPC with their actual status,
+so standard client reconnection can replay retained history. Permanent auth,
+compaction and corruption failures keep their explicit terminal semantics.
+The failed run remains failed; a new bounded acceptance and campaign are required.
 
 **No CI is authorized.** Run future checks manually in isolated development
 workspaces after implementation is requested. Do not enable Actions or add

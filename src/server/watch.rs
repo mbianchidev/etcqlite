@@ -68,6 +68,21 @@ async fn enqueue(
         .map_err(|_| Status::cancelled("watch client disconnected"))
 }
 
+fn require_permanent_watch_failure(
+    error: &crate::error::RpcError,
+) -> std::result::Result<(), Status> {
+    let status = error.status();
+    // Active watch cancellation frames can close official-client channels without an error.
+    // Keep temporary writer failures on the RPC path so clients can resume retained history.
+    if matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted
+    ) {
+        return Err(status);
+    }
+    Ok(())
+}
+
 impl Api {
     pub(crate) async fn watch_stream<S>(
         &self,
@@ -110,6 +125,7 @@ impl Api {
                         let (physical, compacted, batches) = match data {
                             Ok(data) => data,
                             Err(error) => {
+                                require_permanent_watch_failure(&error)?;
                                 let compacted = api.runtime.read(|store, _| Ok(store.compact_revision())).await
                                     .map_err(|error| error.status())?;
                                 enqueue(&sender, pb::WatchResponse {
@@ -261,6 +277,29 @@ impl pb::watch_server::Watch for Api {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_read_failures_are_rpc_errors_not_successful_watch_cancellations() {
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::ResourceExhausted,
+        ] {
+            let failure = crate::error::RpcError::new(code, "mock temporary writer failure");
+            let status = require_permanent_watch_failure(&failure).unwrap_err();
+            assert_eq!(status.code(), code);
+            assert_eq!(status.message(), "mock temporary writer failure");
+        }
+        for code in [
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+            tonic::Code::OutOfRange,
+            tonic::Code::DataLoss,
+        ] {
+            let failure = crate::error::RpcError::new(code, "mock permanent watch failure");
+            require_permanent_watch_failure(&failure).unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn retained_replay_yields_to_a_healthy_receiver_when_the_queue_fills() {
