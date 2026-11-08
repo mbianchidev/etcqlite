@@ -189,6 +189,16 @@ semantics remain unchanged. Closed receivers and oversized frames remain
 explicit errors. Long campaigns must use the corrected binary, not silently
 overwrite or reinterpret the failed `1fec3e7` trace.
 
+The matching clean Linux build at `c09d916` subsequently passed 3,072 mixed
+operations in 10.14 seconds and 29,184 operations over 120.23 seconds while one
+identity-pinned voter was paused/resumed for two seconds. Both finite oracles
+passed with zero uncertain outcomes. The same owned three-voter setup has
+started a requested six-hour seeded process-pause/mixed-history campaign.
+Its result remains **pending**. Requested duration, running processes and
+elapsed conversation time do not establish the six-hour or 24-hour gates.
+This profile does not cover disk/fsync faults, complete/asymmetric partitions,
+lease/auth behavior or reconfiguration failure campaigns.
+
 **No CI is authorized.** Run future checks manually in isolated development
 workspaces after implementation is requested. Do not enable Actions or add
 workflows merely because this document describes repeatable checks.
