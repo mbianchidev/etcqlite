@@ -57,7 +57,12 @@ In particular this draft's branch is ahead of the default branch, so its earlier
 installers must not be deleted merely because a newer file exists. Missing or
 unverified ownership/ancestry protects artifacts.
 
-Packages carry the approved project license and third-party notices.
+Packages carry the approved project license and runtime-dependency notices.
+Compiler-only procedural macros and build tools are not redistributed.
+Two crates omit workspace license files from their registry archives; their
+exact upstream notices are checked in with repository, locked version, upstream
+commit and content-digest verification, not guessed license text. Unknown
+notice gaps still block packaging. See [dependency notices](dependency-licenses.md).
 Apache/MIT/other dependency notices retain their own terms; the Contributor
 Covenant retains CC BY-SA attribution. Never represent a local unsigned
 artifact as a signed production package.

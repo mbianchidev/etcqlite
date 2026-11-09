@@ -1,0 +1,18 @@
+{
+  "pbjson@0.9.0": {
+    "repository": "https://github.com/influxdata/pbjson",
+    "license": "MIT",
+    "vcs_commit": "48ee5989564e0ace82ad71b87736d3d1b2e0e1cd",
+    "source": "https://raw.githubusercontent.com/influxdata/pbjson/48ee5989564e0ace82ad71b87736d3d1b2e0e1cd/LICENSE",
+    "file": "third_party/licenses/pbjson-0.9.0-LICENSE",
+    "sha256": "791a00933f2ea7e512856361e026998362241c3918d7be948c24d29441033b55"
+  },
+  "tonic-prost@0.14.9": {
+    "repository": "https://github.com/grpc/grpc-rust",
+    "license": "MIT",
+    "vcs_commit": "4c0f455c264fe2ec9f9ab5d0cc7fd2824d5daf70",
+    "source": "https://raw.githubusercontent.com/grpc/grpc-rust/4c0f455c264fe2ec9f9ab5d0cc7fd2824d5daf70/LICENSE",
+    "file": "third_party/licenses/tonic-prost-0.14.9-LICENSE",
+    "sha256": "5c686e0f7978412b49187ae0e9f77e9b52eea9d8d2e6c0de8694b35817d873b1"
+  }
+}

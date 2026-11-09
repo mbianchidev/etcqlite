@@ -287,6 +287,51 @@ class DistributionTests(unittest.TestCase):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_notice_inventory_excludes_unshipped_compiler_tools_not_runtime_libraries(self):
+        packages = [
+            {"id": name, "targets": [{"kind": ["proc-macro" if name == "macro" else "lib"]}]}
+            for name in ("root", "runtime", "macro", "build", "dev")
+        ]
+        metadata = {
+            "packages": packages,
+            "resolve": {"root": "root", "nodes": [
+                {"id": "root", "deps": [
+                    {"pkg": "runtime", "dep_kinds": [{"kind": None}]},
+                    {"pkg": "macro", "dep_kinds": [{"kind": None}]},
+                    {"pkg": "build", "dep_kinds": [{"kind": "build"}]},
+                    {"pkg": "dev", "dep_kinds": [{"kind": "dev"}]},
+                ]},
+                *[{"id": name, "deps": []} for name in ("runtime", "macro", "build", "dev")],
+            ]},
+        }
+        self.assertEqual({package["id"] for package in release.runtime_packages(metadata)}, {"root", "runtime"})
+
+    def test_missing_workspace_notice_requires_pinned_matching_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            crate = root / "crate"
+            crate.mkdir()
+            (crate / ".cargo_vcs_info.json").write_text(json.dumps({"git": {"sha1": "a" * 40}}))
+            notice = root / "licenses" / "mock-LICENSE"
+            notice.parent.mkdir()
+            notice.write_text("Synthetic license fixture\n")
+            package = {"name": "mock", "version": "1.0.0", "repository": "https://example.invalid/mock", "license": "MIT", "manifest_path": str(crate / "Cargo.toml")}
+            entry = {
+                "repository": package["repository"], "license": "MIT", "vcs_commit": "a" * 40,
+                "file": "licenses/mock-LICENSE", "source": "https://example.invalid/pinned/LICENSE",
+                "sha256": install.sha256(notice),
+            }
+            self.assertEqual(release.redistributable_notices(package, root, {"mock@1.0.0": entry}), [notice.resolve()])
+            with self.assertRaisesRegex(ValueError, "missing redistributable"):
+                release.redistributable_notices(package, root, {})
+            entry["vcs_commit"] = "b" * 40
+            with self.assertRaisesRegex(ValueError, "provenance"):
+                release.redistributable_notices(package, root, {"mock@1.0.0": entry})
+            entry["vcs_commit"] = "a" * 40
+            notice.write_text("modified")
+            with self.assertRaisesRegex(ValueError, "content/containment"):
+                release.redistributable_notices(package, root, {"mock@1.0.0": entry})
+
     def test_semver_normalization_precedence_and_exact_gap_cases(self):
         for bad in ["1", "1.2", "01.2.3", "1.2.3-01", "vV1.2.3", "1.2.3_", "1.2.3-a..b", "1.2.3\n"]:
             with self.subTest(bad=bad), self.assertRaises(ValueError):

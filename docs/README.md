@@ -13,6 +13,7 @@ remains disabled. See [development](development.md) for runnable checks.
 | [Logging](logging.md) | Private streams, settings, redaction, rotation, retention and failure diagnostics |
 | [Troubleshooting](troubleshooting.md) | Safe diagnostics and recovery without deleting user data |
 | [Local releases](releases.md) | Real local package/install verification, provenance and deliberately disabled CI templates |
+| [Dependency notices](dependency-licenses.md) | Runtime inventory, immutable upstream license evidence and retained third-party terms |
 | [Development](development.md) | Manual build/test commands, pinned tools, and current implementation boundary |
 | [Requirements](requirements.md) | Confirmed requirements, proposed product boundary, non-goals, and success criteria |
 | [Alternatives and positioning](alternatives.md) | Competitor comparison, proposed USP, evidence boundaries, and reuse decisions |

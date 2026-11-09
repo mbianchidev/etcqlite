@@ -100,35 +100,70 @@ def license_files(directory):
     return sorted(matches)
 
 
-def add_notices(stage, payload):
-    host = re.search(r"(?m)^host: (.+)$", command(["rustc", "-vV"], capture=True).decode())
-    if host is None:
-        raise ValueError("cannot determine the native Rust target for dependency notices")
-    cargo = json.loads(command(["cargo", "metadata", "--locked", "--format-version=1", "--filter-platform", host[1]], cwd=stage, capture=True))
+def runtime_packages(cargo):
+    packages = {package["id"]: package for package in cargo["packages"]}
     graph = {node["id"]: node for node in cargo["resolve"]["nodes"]}
     selected, pending = set(), [cargo["resolve"]["root"]]
     while pending:
         identity = pending.pop()
         if identity in selected:
             continue
+        package = packages[identity]
+        if any("proc-macro" in target["kind"] for target in package["targets"]):
+            continue
         selected.add(identity)
         for dependency in graph[identity]["deps"]:
-            if any(kind["kind"] != "dev" for kind in dependency["dep_kinds"]):
+            if any(kind["kind"] is None for kind in dependency["dep_kinds"]):
                 pending.append(dependency["pkg"])
-    for package in cargo["packages"]:
-        if package["id"] not in selected:
-            continue
-        directory = Path(package["manifest_path"]).parent
-        notices = license_files(directory)
+    return [package for package in cargo["packages"] if package["id"] in selected]
+
+
+def redistributable_notices(package, stage, sources):
+    directory = Path(package["manifest_path"]).parent
+    notices = license_files(directory)
+    if notices:
+        return notices
+    identity = f"{package['name']}@{package['version']}"
+    source = sources.get(identity)
+    if source is None:
+        raise ValueError(f"missing redistributable Rust dependency notices: {identity}")
+    vcs = install.read_json(directory / ".cargo_vcs_info.json", 8192)
+    if source["repository"] != package["repository"] or source["license"] != package["license"] or source["vcs_commit"] != vcs["git"]["sha1"]:
+        raise ValueError(f"curated notice provenance no longer matches the locked dependency: {identity}")
+    path = (stage / source["file"]).resolve()
+    if not path.is_relative_to(stage.resolve()) or path.is_symlink() or install.sha256(path) != source["sha256"]:
+        raise ValueError(f"curated notice content/containment verification failed: {identity}")
+    print(f"Bundling verified workspace notice for {identity} from {source['source']}", file=sys.stderr)
+    return [path]
+
+
+def add_notices(stage, payload):
+    host = re.search(r"(?m)^host: (.+)$", command(["rustc", "-vV"], capture=True).decode())
+    if host is None:
+        raise ValueError("cannot determine the native Rust target for dependency notices")
+    cargo = json.loads(command(["cargo", "metadata", "--locked", "--format-version=1", "--filter-platform", host[1]], cwd=stage, capture=True))
+    sources = install.read_json(stage / "script" / "notice_sources.json")
+    for package in runtime_packages(cargo):
         if package["name"] == "etcqlite":
             continue
-        if not notices:
-            raise ValueError(f"missing redistributable Rust dependency notices: {package['name']} {package['version']}")
+        notices = redistributable_notices(package, stage, sources)
         for notice in notices:
             target = payload / "licenses" / "rust" / f"{package['name']}-{package['version']}" / notice.name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(notice, target)
-    module_data = command(["go", "-C", str(stage / "tools"), "list", "-deps", "-json", "./snapshot"], capture=True).decode()
+    install.atomic_json(payload / "licenses" / "workspace-notice-sources.json", sources)
+    sysroot = Path(command([os.environ.get("RUSTC", "rustc"), "--print", "sysroot"], capture=True).decode().strip())
+    rust_notices = []
+    for directory in (sysroot, sysroot / "share" / "doc" / "rust"):
+        if directory.is_dir():
+            rust_notices.extend(license_files(directory))
+    if not rust_notices:
+        raise ValueError("the installed Rust toolchain lacks standard-library redistribution notices")
+    for notice in rust_notices:
+        target = payload / "licenses" / "rust-stdlib" / notice.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(notice, target)
+    module_data = command(["go", "-C", str(stage / "tools"), "list", "-mod=readonly", "-deps", "-json", "./snapshot"], capture=True).decode()
     decoder = json.JSONDecoder()
     modules = {}
     offset = 0
@@ -150,9 +185,12 @@ def add_notices(stage, payload):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(notice, target)
     go_root = Path(command(["go", "env", "GOROOT"], capture=True).decode().strip())
+    go_license = next((path for path in (go_root / "LICENSE", go_root.parent / "LICENSE") if path.is_file() and not path.is_symlink()), None)
+    if go_license is None:
+        raise ValueError("the installed Go toolchain lacks its standard-library license (SDK root or Homebrew installation root)")
     target = payload / "licenses" / "go" / "stdlib" / "LICENSE"
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(go_root / "LICENSE", target)
+    shutil.copyfile(go_license, target)
     for relative in ("vendor/omnipaxos/LICENSE", "proto/etcd/LICENSE", "proto/google/LICENSE", "proto/protoc-gen-openapiv2/LICENSE"):
         target = payload / "licenses" / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -293,6 +331,7 @@ def run(args):
             with tarfile.open(fileobj=io.BytesIO(archive)) as source_tar:
                 source_tar.extractall(stage, filter="data")
             stage_version(stage, chosen)
+            add_notices(stage, payload)
             env = dict(os.environ, GIT_PAGER="cat", GH_PAGER="cat", PAGER="cat")
             env["CARGO_TARGET_DIR"] = str(ROOT / "target" / "distribution-build")
             env["CARGO_BUILD_JOBS"] = str(args.jobs)
@@ -312,7 +351,6 @@ def run(args):
                 shutil.copyfile(stage / name, payload / name)
             shutil.copyfile(stage / "script" / "install.py", payload / "install.py")
             shutil.copytree(stage / "docs", payload / "docs")
-            add_notices(stage, payload)
             manifest = {
                 "format": 1, "kind": "etcqlite-development-package", "version": chosen,
                 "platform": target, "source_commit": source, "source_dirty": plan["source_dirty"],
