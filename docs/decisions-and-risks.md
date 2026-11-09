@@ -12,7 +12,7 @@ explicit owner input before dependent work starts.
 
 | ID | Decision | State | Reason / required resolution |
 | --- | --- | --- | --- |
-| D01 | Private implementation repository; no CI | Confirmed | Implementation supersedes docs-only restriction; Actions disabled |
+| D01 | Private implementation repository; inactive CI | Confirmed | Actions remains disabled; approved templates use `.disabled_yaml`, not active workflows |
 | D02 | SQLite-backed state and non-Raft product consensus | Confirmed | Core requested properties |
 | D03 | Etcqlite working name | Proposed | Matches the chosen concept; legal/package clearance not performed |
 | D04 | Client/API compatibility, not etcd peer compatibility | Proposed | Non-Raft peers cannot transparently join an etcd Raft cluster |
@@ -28,8 +28,11 @@ explicit owner input before dependent work starts.
 | D14 | Porto opt-in lifecycle, inspector read-only | Proposed | Reuse existing product boundaries; no direct SQL mutations |
 | D15 | Linux AMD64/ARM64 first; macOS dev next | Proposed | Native storage correctness before additional platform guarantees |
 | D16 | At least 20% primary-workload throughput improvement | Proposed acceptance target | Not a measurement; owner freezes it before implementation |
-| D17 | License | Open | No license or public distribution authorization selected |
+| D17 | License | Confirmed | MIT, copyright 2026 Matteo Bianchi (mbianchidev); third-party terms preserved; visibility/publication not changed |
 | D18 | Timeline and staffing | Open | Estimate after M0 evidence; do not promise a production-ready date |
+| D19 | Private rotating service logs | Confirmed | Existing tracing/stderr preserved; configured node-base path, one live stream, UTC/size rotation and 30-day default retention |
+| D20 | Explicit local developer distribution | Confirmed | Native CLI packages and offline private-prefix activation only; no desktop UI, automatic-update feed, release publication or live engine upgrade |
+| D21 | Security and conduct policy | Confirmed | Maintainer-approved private reporting/enforcement; best effort, no response/fix deadline; security support current main/latest published release |
 
 ## Risk register
 

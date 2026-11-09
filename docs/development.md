@@ -111,6 +111,13 @@ make install
 target/install/bin/etcqlite --help
 ```
 
+Use [installation](installation.md), [configuration](configuration.md) and
+[logging](logging.md) for user-facing setup and diagnostics. New service file
+logging is under the initialized node's private logs directory by default;
+offline commands retain their existing stdout/stderr behavior.
+For a clean, version-verified developer archive and transactional prefix
+installation, use [local releases](releases.md), not a system-app replacement.
+
 ## Toolchain and checks
 
 Use Rust/Cargo 1.99 or later and Go 1.26 or later. The initial local runs use Rust 1.99.1,
@@ -123,6 +130,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo audit --deny warnings
 go -C tools test ./...
 go -C tools vet ./...
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s script -p 'test_*.py'
+bash script/release.sh --dry-run
 ```
 
 The protocol dependency is the maintained local fork under `vendor/omnipaxos`.

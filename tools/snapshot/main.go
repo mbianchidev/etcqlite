@@ -21,6 +21,10 @@ const maxSnapshotBytes int64 = 16 << 30
 const maxManifestBytes int64 = 512 << 20
 const maxRecordBytes = 16 << 20
 
+var version = "development"
+var buildSHA = "unknown"
+var buildDirty = "true"
+
 func knownBucket(name []byte) bool {
 	switch string(name) {
 	case "alarm", "auth", "authRoles", "authUsers", "cluster", "key", "lease", "members", "members_removed", "meta":
@@ -49,6 +53,25 @@ type BucketEntry struct {
 }
 
 func main() {
+	if len(os.Args) == 2 {
+		switch os.Args[1] {
+		case "--version":
+			fmt.Printf("etcqlite-snapshot %s\n", version)
+			return
+		case "--build-info":
+			if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
+				"version": version, "build": buildSHA, "dirty": buildDirty == "true",
+			}); err != nil {
+				fmt.Fprintln(os.Stderr, "etcqlite-snapshot build info:", err)
+				os.Exit(1)
+			}
+			return
+		case "--help", "-h":
+			fmt.Println("Usage: etcqlite-snapshot export <manifest.json> <snapshot.db> | import <snapshot.db> <manifest.json> | stage <snapshot.db> <interchange.sqlite> | export-native <native.snapshot> <snapshot.db>")
+			fmt.Println("Options: --version, --build-info, --help")
+			return
+		}
+	}
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "etcqlite-snapshot:", err)
 		os.Exit(1)

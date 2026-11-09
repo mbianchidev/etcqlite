@@ -9,6 +9,8 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 use tonic::Code;
 use uuid::Uuid;
 
+mod logging;
+
 #[derive(Parser)]
 #[command(
     name = "etcqlite",
@@ -91,6 +93,8 @@ enum Command {
         peer_ca_file: Option<PathBuf>,
         #[arg(long)]
         snapshot_tool: Option<PathBuf>,
+        #[command(flatten)]
+        logging: logging::Options,
     },
 }
 
@@ -150,6 +154,7 @@ enum SnapshotCommand {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let cli = Cli::parse();
     let filter = match std::env::var("RUST_LOG") {
         Ok(value) => match tracing_subscriber::EnvFilter::try_new(value) {
             Ok(filter) => filter,
@@ -164,18 +169,37 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    tracing_subscriber::fmt()
-        .json()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .init();
-    match run(Cli::parse()).await {
+    let files = match &cli.command {
+        Command::Serve {
+            data_dir, logging, ..
+        } => match logging.file_options(data_dir) {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("Cannot resolve logging configuration: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => None,
+    };
+    let guard = match logging::Guard::install(files, filter) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("Cannot initialize logging: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error = %error, "etcqlite operation failed");
             ExitCode::FAILURE
         }
+    };
+    if let Err(error) = guard.finish() {
+        eprintln!("Cannot flush or stop logging: {error}");
+        return ExitCode::FAILURE;
     }
+    result
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -297,6 +321,7 @@ async fn run(cli: Cli) -> Result<()> {
             peer_key_file,
             peer_ca_file,
             snapshot_tool,
+            logging: _,
         } => {
             let tls = match (cert_file, key_file, client_ca_file) {
                 (Some(certificate), Some(key), client_ca) => Some(TlsOptions {
