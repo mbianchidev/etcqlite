@@ -1,7 +1,13 @@
 pub mod auth;
 pub mod command;
+pub mod inspection;
+pub mod interchange;
 pub mod lease;
+pub mod maintenance;
+pub mod membership;
+pub mod migration;
 mod mvcc;
+pub mod snapshot;
 
 use crate::{
     error::{Result, RpcError},
@@ -110,6 +116,7 @@ pub(crate) struct Apply<'a> {
     pub sub_revision: i64,
     pub modified: bool,
     pub principal: Principal,
+    pub request_id: Uuid,
 }
 
 impl Store {
@@ -119,6 +126,12 @@ impl Store {
     ) -> Result<()> {
         self.ready()?;
         configuration.validate()?;
+        if configuration.configuration_id != 1 {
+            return Err(RpcError::new(
+                Code::FailedPrecondition,
+                "fresh bootstrap requires configuration 1; later configurations require verified join or restore",
+            ));
+        }
         configuration.member(self.identity.member_id)?;
         if configuration.cluster_id != self.identity.cluster_id
             || self.applied_index() != 0
@@ -132,6 +145,7 @@ impl Store {
         let result = (|| {
             use prost::Message;
             let bytes = serde_json::to_vec(configuration)?;
+            let schema_version = self.schema_version()?;
             let transaction = self
                 .connection
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -145,13 +159,7 @@ impl Store {
             )?;
             transaction.execute("DELETE FROM cluster_members", [])?;
             for member in &configuration.members {
-                let wire = pb::Member {
-                    id: member.id,
-                    name: member.name.clone(),
-                    peer_ur_ls: vec![member.peer_url.clone()],
-                    client_ur_ls: vec![member.client_url.clone()],
-                    is_learner: member.learner,
-                };
+                let wire = member.wire();
                 let bytes = wire.encode_to_vec();
                 transaction.execute(
                     "INSERT INTO cluster_members(id, pid, member, checksum) VALUES(?1, ?2, ?3, ?4)",
@@ -165,6 +173,9 @@ impl Store {
             }
             let mut metadata = self.metadata.clone();
             metadata.configuration_id = configuration.configuration_id;
+            if schema_version == 2 {
+                membership::save_configuration(&transaction, configuration, 0, None)?;
+            }
             save_metadata(&transaction, &metadata)?;
             transaction.commit()?;
             self.metadata = metadata;
@@ -211,7 +222,12 @@ impl Store {
                 let configuration = self
                     .cluster_configuration()?
                     .ok_or_else(|| RpcError::corrupt("cluster mode has no configuration"))?;
-                if configuration.member(self.identity.member_id)?.client_url != client_url {
+                if !configuration
+                    .member(self.identity.member_id)?
+                    .client_url
+                    .is_empty()
+                    && configuration.member(self.identity.member_id)?.client_url != client_url
+                {
                     return Err(RpcError::new(
                         Code::FailedPrecondition,
                         "client listener does not match the persisted cluster endpoint",
@@ -228,6 +244,7 @@ impl Store {
                 "UPDATE node_state SET runtime_epoch = ?1, checksum = ?2 WHERE id = 1",
                 params![epoch, identity_digest(&self.identity, &mode, epoch)?],
             )?;
+            transaction.execute("DELETE FROM compaction_hashes", [])?;
             let member = pb::Member {
                 id: self.identity.member_id,
                 name: self.identity.name.clone(),
@@ -323,6 +340,61 @@ impl Store {
         })())
     }
 
+    pub fn require_admin(&self, principal: &Principal) -> Result<()> {
+        self.ready()?;
+        self.guard(auth::require_admin(
+            &self.connection,
+            &self.metadata,
+            principal,
+        ))
+    }
+
+    pub fn read_health(&self) -> Result<()> {
+        self.ready()?;
+        self.guard(maintenance::check_read_health(&self.connection))?;
+        if !self.identity_registered()? {
+            return Err(RpcError::new(
+                Code::Unavailable,
+                "member identity registration is pending",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn quota_bytes(&self) -> u64 {
+        self.metadata.quota_bytes
+    }
+
+    pub fn bootstrap_quota(&mut self, bytes: u64) -> Result<()> {
+        self.ready()?;
+        if bytes == 0
+            || bytes > i64::MAX as u64
+            || self.applied_index() != 0
+            || self.revision() != 1
+            || self.metadata.logical_bytes != 0
+        {
+            return Err(RpcError::invalid(
+                "quota configuration requires a fresh empty node and a positive signed-range byte limit",
+            ));
+        }
+        let result = (|| {
+            let mut metadata = self.metadata.clone();
+            metadata.quota_bytes = bytes;
+            let transaction = self
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            save_metadata(&transaction, &metadata)?;
+            transaction.commit()?;
+            self.metadata = metadata;
+            Ok(())
+        })();
+        self.guard(result)
+    }
+
+    pub fn downgrade_target(&self) -> Option<&str> {
+        self.metadata.downgrade_target.as_deref()
+    }
+
     pub fn defragment(&mut self, principal: &Principal) -> Result<pb::DefragmentResponse> {
         self.ready()?;
         let result = (|| {
@@ -383,12 +455,13 @@ impl Store {
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("schema.sql"))?;
+        transaction.execute_batch(include_str!("migrations/002-administration.sql"))?;
         transaction.execute(
             "INSERT INTO node_state(id, cluster_id, member_id, name, mode, checksum) VALUES(1, ?1, ?2, ?3, 'local', ?4)",
             params![identity.cluster_id.to_be_bytes(), identity.member_id.to_be_bytes(), identity.name, identity_digest(&identity, "local", 0)?],
         )?;
         insert_metadata(&transaction, &metadata)?;
-        transaction.pragma_update(None, "user_version", 1)?;
+        transaction.pragma_update(None, "user_version", 2)?;
         transaction.commit()?;
         File::open(directory)?.sync_all()?;
         let parent = directory
@@ -430,7 +503,7 @@ impl Store {
         )?;
         crate::sqlite::configure(&connection)?;
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 1 {
+        if version != 1 && version != 2 {
             return Err(RpcError::corrupt(
                 "unsupported SQLite schema; startup never resets or migrates it implicitly",
             ));
@@ -455,6 +528,7 @@ impl Store {
             return Err(RpcError::corrupt("node identity checksum mismatch"));
         }
         let metadata = load_metadata(&connection)?;
+        snapshot::verify_records(&connection)?;
         Ok(Self {
             connection,
             identity,
@@ -468,6 +542,36 @@ impl Store {
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
+
+    pub(crate) fn pinned_reader(&self, principal: &Principal) -> Result<Self> {
+        self.ready()?;
+        self.require_admin(principal)?;
+        self.guard((|| {
+            let connection = Connection::open_with_flags(
+                &self.path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            connection.execute_batch(
+                "PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; BEGIN DEFERRED;",
+            )?;
+            let metadata = load_metadata(&connection)?;
+            if metadata.revision != self.revision()
+                || metadata.applied_index != self.applied_index()
+            {
+                return Err(RpcError::corrupt(
+                    "snapshot reader differs from the owned writer frontier",
+                ));
+            }
+            Ok(Self {
+                connection,
+                metadata,
+                identity: self.identity.clone(),
+                path: self.path.clone(),
+                healthy: Arc::clone(&self.healthy),
+                _lock: self._lock.try_clone()?,
+            })
+        })())
+    }
     pub fn revision(&self) -> i64 {
         self.metadata.revision
     }
@@ -476,6 +580,14 @@ impl Store {
     }
     pub fn applied_index(&self) -> u64 {
         self.metadata.applied_index
+    }
+    pub fn configuration_base(&self) -> u64 {
+        self.metadata.configuration_base
+    }
+    pub fn schema_version(&self) -> Result<u32> {
+        Ok(self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?)
     }
     pub fn auth_revision(&self) -> u64 {
         self.metadata.auth_revision
@@ -586,6 +698,7 @@ impl Store {
                 sub_revision: 0,
                 modified: false,
                 principal,
+                request_id,
             };
             let result = context.execute_command(&request);
             match &result {
@@ -595,6 +708,13 @@ impl Store {
                 }
                 Err(error) if !error.is_storage_fault() => {
                     transaction.execute_batch("ROLLBACK TO operation; RELEASE operation")?;
+                    if error.status().code() == Code::ResourceExhausted
+                        && error.status().message() == "etcdserver: mvcc: database space exceeded"
+                    {
+                        transaction.execute(
+                            "INSERT OR IGNORE INTO alarms(member_id, alarm) SELECT member_id, 1 FROM node_state UNION SELECT id, 1 FROM cluster_members", [],
+                        )?;
+                    }
                 }
                 Err(error) => return Err(error.clone()),
             }
@@ -621,6 +741,7 @@ impl Store {
         self.ready()?;
         let result = (|| {
             mvcc::validate_range(request)?;
+            maintenance::check_read_health(&self.connection)?;
             let transaction = self.connection.unchecked_transaction()?;
             let metadata = load_metadata(&transaction)?;
             let response = mvcc::range(&transaction, &metadata, request)?;
@@ -638,6 +759,7 @@ impl Store {
     ) -> Result<Vec<(i64, Vec<mvccpb::Event>)>> {
         self.ready()?;
         let result = (|| {
+            maintenance::check_read_health(&self.connection)?;
             let transaction = self.connection.unchecked_transaction()?;
             let metadata = load_metadata(&transaction)?;
             if start <= metadata.compacted_revision {

@@ -233,6 +233,18 @@ impl Apply<'_> {
         if revision < 0 {
             return Err(compacted());
         }
+        let hash = super::maintenance::compaction_hash(
+            self.transaction,
+            self.metadata.compacted_revision,
+            revision,
+        )?;
+        self.transaction.execute(
+            "INSERT INTO compaction_hashes(revision, compacted_revision, hash) VALUES(?1, ?2, ?3)",
+            params![revision, self.metadata.compacted_revision, hash],
+        )?;
+        self.transaction.execute(
+            "DELETE FROM compaction_hashes WHERE revision NOT IN (SELECT revision FROM compaction_hashes ORDER BY revision DESC LIMIT 10)", [],
+        )?;
         let mut statement = self.transaction.prepare(
             "SELECT main_revision, sub_revision, kind FROM (
              SELECT main_revision, sub_revision, kind,
@@ -539,7 +551,11 @@ pub(super) fn current(connection: &Connection, key: &[u8]) -> Result<Option<mvcc
         .transpose()
 }
 
-fn decode_current(key: &[u8], bytes: &[u8], checksum: &[u8]) -> Result<mvccpb::KeyValue> {
+pub(super) fn decode_current(
+    key: &[u8],
+    bytes: &[u8],
+    checksum: &[u8],
+) -> Result<mvccpb::KeyValue> {
     if digest(&[key, bytes]) != checksum {
         return Err(RpcError::corrupt("current KV checksum mismatch"));
     }

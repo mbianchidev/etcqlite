@@ -407,9 +407,15 @@ where
         common_prefix_idx: usize,
         other_logs_decided_idx: usize,
     ) -> LogSync<T> {
-        let decided_idx = self.internal_storage.get_decided_idx();
+        let decided_idx = self.internal_storage.get_decided_idx_without_stopsign();
+        let data_end = self.internal_storage.get_accepted_idx()
+            - usize::from(self.internal_storage.get_stopsign().is_some());
+        let common_prefix_idx = common_prefix_idx.min(data_end);
+        let other_logs_decided_idx = other_logs_decided_idx.min(decided_idx);
+        let prefer_snapshot = T::Snapshot::prefer_snapshot_sync()
+            || common_prefix_idx < self.internal_storage.get_compacted_idx();
         let (decided_snapshot, suffix, sync_idx) =
-            if T::Snapshot::use_snapshots() && decided_idx > common_prefix_idx {
+            if T::Snapshot::use_snapshots() && prefer_snapshot && decided_idx > common_prefix_idx {
                 // Note: We snapshot from the other log's decided index and not the common prefix because
                 // snapshots currently only work on decided entries.
                 let (delta_snapshot, compacted_idx) = self
@@ -422,6 +428,7 @@ where
                     .expect(READ_ERROR_MSG);
                 (delta_snapshot, suffix, compacted_idx)
             } else {
+                let common_prefix_idx = common_prefix_idx.max(other_logs_decided_idx);
                 let suffix = self
                     .internal_storage
                     .get_suffix(common_prefix_idx)

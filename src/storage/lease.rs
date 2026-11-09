@@ -51,6 +51,12 @@ impl Apply<'_> {
         if !matches!(request, LeaseCommand::Expire { .. }) {
             auth::require_user(self.transaction, &self.metadata, &self.principal)?;
         }
+        if !matches!(request, LeaseCommand::Renew { .. }) {
+            super::maintenance::check_read_health(self.transaction)?;
+        }
+        if matches!(request, LeaseCommand::Grant { .. }) {
+            super::maintenance::check_allocation(self.transaction)?;
+        }
         match *request {
             LeaseCommand::Grant { id, ttl, now_ms } => {
                 if id == 0 || now_ms < 0 {

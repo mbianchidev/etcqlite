@@ -91,7 +91,10 @@ where
     /// Whether `T` is snapshottable. If not, simply return `false` and leave the other functions `unimplemented!()`.
     fn use_snapshots() -> bool;
 
-    //fn size_hint() -> usize;  // TODO: To let the system know trade-off of using entries vs snapshot?
+    /// Prefer snapshots during synchronization even when the required raw log suffix is retained.
+    fn prefer_snapshot_sync() -> bool {
+        true
+    }
 }
 
 /// The Result type returned by the storage API.

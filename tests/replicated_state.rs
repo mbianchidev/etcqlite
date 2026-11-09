@@ -1,6 +1,6 @@
 use etcqlite::{
     cluster::{Command, Configuration, Member},
-    replica::Replica,
+    replica::{ELECTION_TIMEOUT_TICKS, Replica},
     storage::{Identity, KvRequest, Store, auth::Principal, command::Mutation},
     wire::etcdserverpb as pb,
 };
@@ -10,7 +10,6 @@ use uuid::Uuid;
 
 struct Cluster {
     directory: TempDir,
-    configuration: Configuration,
     nodes: BTreeMap<u64, (Replica, Store)>,
     isolated: BTreeSet<u64>,
 }
@@ -21,6 +20,7 @@ impl Cluster {
         let configuration = Configuration {
             cluster_id: 42,
             configuration_id: 1,
+            bootstrap_digest: None,
             members: (1..=3)
                 .map(|id| Member {
                     id,
@@ -29,6 +29,8 @@ impl Cluster {
                     learner: false,
                     client_url: format!("https://127.0.0.1:{}", 27000 + id),
                     peer_url: format!("https://127.0.0.1:{}", 28000 + id),
+                    additional_peer_urls: Vec::new(),
+                    incarnation: None,
                 })
                 .collect(),
         };
@@ -45,48 +47,63 @@ impl Cluster {
             )
             .unwrap();
             store.configure_cluster(&configuration).unwrap();
-            let replica = Replica::open(store.path(), configuration.clone(), member.id).unwrap();
+            let replica = Replica::open(&store).unwrap();
             nodes.insert(member.id, (replica, store));
         }
         let mut cluster = Self {
             directory,
-            configuration,
             nodes,
             isolated: BTreeSet::new(),
         };
-        cluster.run(30);
+        cluster.run(3 * ELECTION_TIMEOUT_TICKS as usize);
         cluster
     }
 
     fn run(&mut self, ticks: usize) {
+        self.run_skipping_apply(ticks, None);
+    }
+
+    fn run_skipping_apply(&mut self, ticks: usize, skipped: Option<u64>) {
         for _ in 0..ticks {
-            for (replica, _) in self.nodes.values_mut() {
-                replica.tick().unwrap();
+            for (replica, store) in self.nodes.values_mut() {
+                replica.tick(store).unwrap();
             }
             for _ in 0..30 {
                 let mut messages = Vec::new();
-                for (replica, _) in self.nodes.values_mut() {
-                    messages.extend(replica.outgoing().unwrap());
+                for (id, (replica, _)) in &mut self.nodes {
+                    messages.extend(
+                        replica
+                            .outgoing()
+                            .unwrap()
+                            .into_iter()
+                            .map(|message| (*id, message)),
+                    );
                 }
                 if messages.is_empty() {
                     break;
                 }
                 messages.reverse();
-                for message in messages {
-                    if !self.isolated.contains(&message.get_sender())
-                        && !self.isolated.contains(&message.get_receiver())
+                for (sender, message) in messages {
+                    if !self.isolated.contains(&sender)
+                        && !self.isolated.contains(&message.receiver)
                     {
                         self.nodes
-                            .get_mut(&message.get_receiver())
+                            .get_mut(&message.receiver)
                             .unwrap()
                             .0
-                            .receive(message)
+                            .receive(
+                                message.configuration.configuration_id,
+                                sender,
+                                message.message,
+                            )
                             .unwrap();
                     }
                 }
             }
-            for (replica, store) in self.nodes.values_mut() {
-                replica.apply(store).unwrap();
+            for (id, (replica, store)) in &mut self.nodes {
+                if Some(*id) != skipped {
+                    replica.apply(store).unwrap();
+                }
             }
         }
     }
@@ -107,6 +124,46 @@ impl Cluster {
             })
             .unwrap();
     }
+}
+
+#[test]
+fn native_restore_replays_durable_decisions_not_yet_applied_at_snapshot_time() {
+    let mut cluster = Cluster::new();
+    cluster.put(1, b"mock/unapplied", b"decided");
+    cluster.run_skipping_apply(20, Some(1));
+    assert_eq!(cluster.nodes[&1].1.revision(), 1);
+    assert_eq!(cluster.nodes[&2].1.revision(), 2);
+    let artifact = cluster.nodes[&1]
+        .1
+        .native_snapshot(&Principal::Internal)
+        .unwrap();
+    let restored = cluster.directory.path().join("restored");
+    let result = etcqlite::storage::snapshot::restore(
+        artifact.path(),
+        &restored,
+        Identity {
+            cluster_id: 99,
+            member_id: 88,
+            name: "mock-restored".into(),
+        },
+        None,
+        0,
+        false,
+    )
+    .unwrap();
+    assert_eq!(result.revision, 2);
+    let store = Store::open(restored).unwrap();
+    assert_eq!(
+        store
+            .range(&pb::RangeRequest {
+                key: b"mock/unapplied".to_vec(),
+                ..Default::default()
+            })
+            .unwrap()
+            .kvs[0]
+            .value,
+        b"decided"
+    );
 }
 
 #[test]
@@ -139,7 +196,7 @@ fn real_sqlite_state_application_follows_only_decided_non_raft_commands() {
         .0
         .propose(Command::Barrier { id: Uuid::new_v4() })
         .unwrap();
-    cluster.run(30);
+    cluster.run(3 * ELECTION_TIMEOUT_TICKS as usize);
     assert!(
         cluster.nodes[&leader]
             .1
@@ -156,7 +213,7 @@ fn real_sqlite_state_application_follows_only_decided_non_raft_commands() {
     cluster.run(30);
     assert_eq!(cluster.nodes[&majority].1.revision(), 3);
     cluster.isolated.clear();
-    cluster.run(40);
+    cluster.run(3 * ELECTION_TIMEOUT_TICKS as usize);
     let expected = cluster.nodes[&majority]
         .1
         .range(&pb::RangeRequest {
@@ -176,6 +233,22 @@ fn real_sqlite_state_application_follows_only_decided_non_raft_commands() {
                 .unwrap(),
             expected
         );
+        let connection = rusqlite::Connection::open_with_flags(
+            store.path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let compacted: i64 = connection
+            .query_row(
+                "SELECT compacted FROM protocol_state WHERE configuration_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            compacted, 0,
+            "retained command logs must resynchronize without full-history snapshot blobs"
+        );
     }
 }
 
@@ -187,7 +260,7 @@ fn replica_restart_replays_durable_state_without_repeating_acknowledged_effects(
     cluster.nodes.remove(&1);
     let path = cluster.directory.path().join("node-1");
     let store = Store::open(path).unwrap();
-    let replica = Replica::open(store.path(), cluster.configuration.clone(), 1).unwrap();
+    let replica = Replica::open(&store).unwrap();
     cluster.nodes.insert(1, (replica, store));
     cluster.run(40);
     assert_eq!(

@@ -49,7 +49,7 @@ impl Stream for Output {
     }
 }
 
-fn enqueue(
+async fn enqueue(
     sender: &tokio::sync::mpsc::Sender<std::result::Result<pb::WatchResponse, Status>>,
     response: pb::WatchResponse,
 ) -> std::result::Result<(), Status> {
@@ -58,14 +58,29 @@ fn enqueue(
             "watch revision exceeds the response limit; enable fragmentation",
         ));
     }
-    sender.try_send(Ok(response)).map_err(|error| match error {
-        tokio::sync::mpsc::error::TrySendError::Full(_) => Status::resource_exhausted(
-            "watch consumer is too slow; reconnect from retained history",
-        ),
-        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-            Status::cancelled("watch client disconnected")
-        }
-    })
+    tokio::time::timeout(Duration::from_secs(5), sender.send(Ok(response)))
+        .await
+        .map_err(|_| {
+            Status::resource_exhausted(
+                "watch consumer is too slow; reconnect from retained history",
+            )
+        })?
+        .map_err(|_| Status::cancelled("watch client disconnected"))
+}
+
+fn require_permanent_watch_failure(
+    error: &crate::error::RpcError,
+) -> std::result::Result<(), Status> {
+    let status = error.status();
+    // Active watch cancellation frames can close official-client channels without an error.
+    // Keep temporary writer failures on the RPC path so clients can resume retained history.
+    if matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::ResourceExhausted
+    ) {
+        return Err(status);
+    }
+    Ok(())
 }
 
 impl Api {
@@ -110,6 +125,7 @@ impl Api {
                         let (physical, compacted, batches) = match data {
                             Ok(data) => data,
                             Err(error) => {
+                                require_permanent_watch_failure(&error)?;
                                 let compacted = api.runtime.read(|store, _| Ok(store.compact_revision())).await
                                     .map_err(|error| error.status())?;
                                 enqueue(&sender, pb::WatchResponse {
@@ -118,7 +134,7 @@ impl Api {
                                     compact_revision: if error.status().code() == tonic::Code::OutOfRange { compacted } else { 0 },
                                     cancel_reason: error.status().message().to_owned(),
                                     ..Default::default()
-                                })?;
+                                }).await?;
                                 canceled.push(id);
                                 continue;
                             }
@@ -150,10 +166,10 @@ impl Api {
                                     enqueue(&sender, pb::WatchResponse {
                                         header: Some(header), watch_id: id, events,
                                         fragment: index + 1 < count, ..Default::default()
-                                    })?;
+                                    }).await?;
                                 }
                             } else {
-                                enqueue(&sender, pb::WatchResponse { header: Some(header), watch_id: id, events, ..Default::default() })?;
+                                enqueue(&sender, pb::WatchResponse { header: Some(header), watch_id: id, events, ..Default::default() }).await?;
                             }
                         }
                         watch.next_revision = physical.revision.checked_add(1)
@@ -162,7 +178,7 @@ impl Api {
                         if watch.request.progress_notify && watch.progress.elapsed() >= Duration::from_secs(10) {
                             let mut header = physical;
                             header.revision = watch.frontier;
-                            enqueue(&sender, pb::WatchResponse { header: Some(header), watch_id: id, ..Default::default() })?;
+                            enqueue(&sender, pb::WatchResponse { header: Some(header), watch_id: id, ..Default::default() }).await?;
                             watch.progress = Instant::now();
                         }
                     }
@@ -172,7 +188,7 @@ impl Api {
                         if let Some(frontier) = watches.values().map(|watch| watch.frontier).min() {
                             header.revision = frontier;
                         }
-                        enqueue(&sender, pb::WatchResponse { header: Some(header), watch_id: -1, ..Default::default() })?;
+                        enqueue(&sender, pb::WatchResponse { header: Some(header), watch_id: -1, ..Default::default() }).await?;
                         progress_requested = false;
                     }
                     tokio::select! {
@@ -210,7 +226,7 @@ impl Api {
                                     enqueue(&sender, pb::WatchResponse {
                                         header: Some(header), watch_id: id, created: true, canceled: is_compacted,
                                         compact_revision: if is_compacted { compacted } else { 0 }, ..Default::default()
-                                    })?;
+                                    }).await?;
                                     if !is_compacted {
                                         let frontier = (next_revision - 1).min(header.revision);
                                         watches.insert(id, Watch { request: create, next_revision, frontier, progress: Instant::now() });
@@ -221,7 +237,7 @@ impl Api {
                                     enqueue(&sender, pb::WatchResponse {
                                         header: Some(api.runtime.header().await.map_err(|error| error.status())?),
                                         watch_id: cancel.watch_id, canceled: true, ..Default::default()
-                                    })?;
+                                    }).await?;
                                 }
                                 Some(pb::watch_request::RequestUnion::ProgressRequest(_)) => progress_requested = true,
                                 None => return Err(Status::invalid_argument("watch request is empty")),
@@ -255,5 +271,103 @@ impl pb::watch_server::Watch for Api {
     ) -> std::result::Result<Response<Self::WatchStream>, Status> {
         let principal = self.principal(&request).await?;
         self.response(self.watch_stream(principal, request.into_inner()).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_read_failures_are_rpc_errors_not_successful_watch_cancellations() {
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::ResourceExhausted,
+        ] {
+            let failure = crate::error::RpcError::new(code, "mock temporary writer failure");
+            let status = require_permanent_watch_failure(&failure).unwrap_err();
+            assert_eq!(status.code(), code);
+            assert_eq!(status.message(), "mock temporary writer failure");
+        }
+        for code in [
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+            tonic::Code::OutOfRange,
+            tonic::Code::DataLoss,
+        ] {
+            let failure = crate::error::RpcError::new(code, "mock permanent watch failure");
+            require_permanent_watch_failure(&failure).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_replay_yields_to_a_healthy_receiver_when_the_queue_fills() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let producer = tokio::spawn(async move {
+            for id in 1..=64 {
+                enqueue(
+                    &sender,
+                    pb::WatchResponse {
+                        watch_id: id,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+            Ok::<_, Status>(())
+        });
+        let mut received = Vec::new();
+        while let Some(response) = receiver.recv().await {
+            received.push(response.unwrap().watch_id);
+        }
+        producer.await.unwrap().unwrap();
+        assert_eq!(received, (1..=64).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn stalled_receiver_has_a_bounded_terminal_error_without_dropping_queued_frames() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        enqueue(
+            &sender,
+            pb::WatchResponse {
+                watch_id: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let error = enqueue(
+            &sender,
+            pb::WatchResponse {
+                watch_id: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(receiver.recv().await.unwrap().unwrap().watch_id, 1);
+    }
+
+    #[tokio::test]
+    async fn disconnected_receiver_and_oversized_frames_remain_explicit_errors() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        assert_eq!(
+            enqueue(&sender, pb::WatchResponse::default())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Cancelled
+        );
+        let response = pb::WatchResponse {
+            cancel_reason: "x".repeat(MAX_FRAME_BYTES),
+            ..Default::default()
+        };
+        assert_eq!(
+            enqueue(&sender, response).await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted
+        );
     }
 }

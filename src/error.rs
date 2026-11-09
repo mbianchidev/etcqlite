@@ -6,6 +6,8 @@ use tonic::{Code, Status};
 pub struct RpcError {
     code: i32,
     message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    storage_fault: Option<bool>,
 }
 
 impl RpcError {
@@ -13,6 +15,7 @@ impl RpcError {
         Self {
             code: code as i32,
             message: message.into(),
+            storage_fault: None,
         }
     }
 
@@ -29,7 +32,18 @@ impl RpcError {
     }
 
     pub fn is_storage_fault(&self) -> bool {
-        matches!(Code::from_i32(self.code), Code::Internal | Code::DataLoss)
+        self.storage_fault.unwrap_or(matches!(
+            Code::from_i32(self.code),
+            Code::Internal | Code::DataLoss
+        ))
+    }
+
+    pub fn alarm_corrupt() -> Self {
+        Self {
+            code: Code::DataLoss as i32,
+            message: "etcdserver: database corruption".into(),
+            storage_fault: Some(false),
+        }
     }
 }
 

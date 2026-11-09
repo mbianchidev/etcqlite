@@ -1,5 +1,5 @@
 use crate::{
-    cluster::{Command as LogCommand, Configuration},
+    cluster::{Catchup, Command as LogCommand, Configuration, Outgoing, PeerMessage},
     error::{Result, RpcError},
     replica::Replica,
     storage::{
@@ -28,6 +28,7 @@ use uuid::Uuid;
 const QUEUE_CAPACITY: usize = 512;
 type ReadJob = Box<dyn FnOnce(&Store, &State) + Send>;
 type MaintenanceJob = Box<dyn FnOnce(&mut Store, &State) + Send>;
+type ReplicaReadJob = Box<dyn FnOnce(&Store, &State, Option<&Replica>) + Send>;
 
 enum Work {
     Read(ReadJob),
@@ -39,8 +40,16 @@ enum Work {
         reply: oneshot::Sender<Result<Reply>>,
     },
     Barrier(oneshot::Sender<Result<()>>),
-    Peer(omnipaxos::messages::Message<LogCommand>),
-    Reconnected(u64),
+    Peer {
+        configuration_id: u32,
+        sender_id: u64,
+        message: PeerMessage,
+        admission: Vec<tokio::sync::OwnedSemaphorePermit>,
+    },
+    Reconnected(u32, u64),
+    ReplicaRead(ReplicaReadJob),
+    Catchup(Catchup, oneshot::Sender<Result<()>>),
+    Lead(oneshot::Sender<Result<()>>),
     Stop,
 }
 
@@ -48,6 +57,7 @@ pub struct State {
     pub epoch: u64,
     pub leader_id: Option<u64>,
     pub cluster: Option<Configuration>,
+    pub decided_index: u64,
     deadlines: BTreeMap<i64, (u64, Instant)>,
     started: Instant,
     started_ms: i64,
@@ -91,8 +101,12 @@ impl State {
                 .get(&lease.id)
                 .is_none_or(|(generation, _)| *generation != lease.generation)
             {
-                let duration = u64::try_from(lease.ttl)
-                    .map_err(|_| RpcError::corrupt("persisted lease TTL is negative"))?;
+                let duration = u64::try_from(if lease.checkpoint_ttl > 0 {
+                    lease.checkpoint_ttl
+                } else {
+                    lease.ttl
+                })
+                .map_err(|_| RpcError::corrupt("persisted lease TTL is negative"))?;
                 let expiry = Instant::now()
                     .checked_add(Duration::from_secs(duration))
                     .ok_or_else(|| {
@@ -111,7 +125,8 @@ pub struct Runtime {
     active: Arc<AtomicBool>,
     pub changes: Arc<Notify>,
     timeout: Duration,
-    outbox: Arc<Mutex<Option<Receiver<omnipaxos::messages::Message<LogCommand>>>>>,
+    outbox: Arc<Mutex<Option<Receiver<Outgoing>>>>,
+    snapshot_slots: Arc<tokio::sync::Semaphore>,
 }
 
 pub struct Worker {
@@ -136,10 +151,10 @@ impl Runtime {
             let startup: Result<(Store, State, Option<Replica>)> = (|| {
                 let mut store = Store::open(path)?;
                 let configuration = store.cluster_configuration()?;
-                let mut replica = configuration.clone().map(|configuration| Replica::open(store.path(), configuration, store.identity().member_id)).transpose()?;
+                let mut replica = configuration.as_ref().map(|_| Replica::open(&store)).transpose()?;
                 if let Some(replica) = &mut replica { replica.apply(&mut store)?; }
                 let epoch = store.begin_session(&client_url)?;
-                let mut state = State { epoch, leader_id: None, cluster: configuration, deadlines: BTreeMap::new(), started: Instant::now(), started_ms: wall_time_ms()? };
+                let mut state = State { epoch, leader_id: None, cluster: configuration, decided_index: store.applied_index(), deadlines: BTreeMap::new(), started: Instant::now(), started_ms: wall_time_ms()? };
                 state.refresh_leases(&store)?;
                 Ok((store, state, replica))
             })();
@@ -173,6 +188,7 @@ impl Runtime {
                 changes,
                 timeout,
                 outbox: Arc::new(Mutex::new(Some(outbox))),
+                snapshot_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             },
             Worker { sender, thread },
         ))
@@ -273,7 +289,59 @@ impl Runtime {
         self.read(|store, state| Ok(state.header(store))).await
     }
 
-    pub fn take_outbox(&self) -> Result<Receiver<omnipaxos::messages::Message<LogCommand>>> {
+    pub async fn native_snapshot(
+        &self,
+        principal: Principal,
+    ) -> Result<(crate::storage::snapshot::NativeSnapshot, pb::ResponseHeader)> {
+        let permit = self
+            .snapshot_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                RpcError::new(
+                    Code::ResourceExhausted,
+                    "native snapshot capture is at capacity",
+                )
+            })?;
+        let (source, header) = self
+            .read(move |store, state| Ok((store.snapshot_source(&principal)?, state.header(store))))
+            .await?;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            source.capture()
+        })
+        .await
+        .map_err(|error| RpcError::corrupt(format!("native snapshot task: {error}")))??;
+        Ok((snapshot, header))
+    }
+
+    pub async fn maintenance_read<R: Send + 'static>(
+        &self,
+        principal: Principal,
+        function: impl FnOnce(&Store, pb::ResponseHeader) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
+        let permit = self
+            .snapshot_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                RpcError::new(
+                    Code::ResourceExhausted,
+                    "bulk maintenance read is at capacity",
+                )
+            })?;
+        let (reader, header) = self
+            .read(move |store, state| Ok((store.pinned_reader(&principal)?, state.header(store))))
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            function(&reader, header)
+        })
+        .await
+        .map_err(|error| RpcError::corrupt(format!("maintenance reader task: {error}")))?
+    }
+
+    pub fn take_outbox(&self) -> Result<Receiver<Outgoing>> {
         self.outbox
             .lock()
             .map_err(|_| RpcError::corrupt("peer outbox state is poisoned"))?
@@ -281,12 +349,65 @@ impl Runtime {
             .ok_or_else(|| RpcError::corrupt("peer outbox already belongs to a transport"))
     }
 
-    pub fn deliver_peer(&self, message: omnipaxos::messages::Message<LogCommand>) -> Result<()> {
-        self.send(Work::Peer(message))
+    pub fn deliver_peer(
+        &self,
+        configuration_id: u32,
+        sender_id: u64,
+        message: PeerMessage,
+    ) -> Result<()> {
+        self.deliver_admitted_peer(configuration_id, sender_id, message, Vec::new())
     }
 
-    pub fn peer_reconnected(&self, pid: u64) -> Result<()> {
-        self.send(Work::Reconnected(pid))
+    pub(crate) fn deliver_admitted_peer(
+        &self,
+        configuration_id: u32,
+        sender_id: u64,
+        message: PeerMessage,
+        admission: Vec<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<()> {
+        self.send(Work::Peer {
+            configuration_id,
+            sender_id,
+            message,
+            admission,
+        })
+    }
+
+    pub fn peer_reconnected(&self, configuration_id: u32, pid: u64) -> Result<()> {
+        self.send(Work::Reconnected(configuration_id, pid))
+    }
+
+    pub async fn replica_read<R: Send + 'static>(
+        &self,
+        function: impl FnOnce(&Store, &State, &Replica) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
+        let (sender, receiver) = oneshot::channel();
+        self.send(Work::ReplicaRead(Box::new(move |store, state, replica| {
+            let result = replica
+                .ok_or_else(|| {
+                    RpcError::new(
+                        Code::FailedPrecondition,
+                        "local mode has no protocol replica",
+                    )
+                })
+                .and_then(|replica| function(store, state, replica));
+            if sender.send(result).is_err() {
+                tracing::debug!("replica read waiter canceled");
+            }
+        })))?;
+        self.receive(receiver, false).await
+    }
+
+    pub async fn install_catchup(&self, frame: Catchup) -> Result<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.send(Work::Catchup(frame, sender))?;
+        self.receive(receiver, true).await
+    }
+
+    pub async fn attempt_leadership(&self) -> Result<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.send(Work::Lead(sender))?;
+        self.receive(receiver, false).await
     }
 }
 
@@ -312,6 +433,7 @@ struct Pending {
     response: ResponseWaiter,
     deadline: Instant,
     retried: Instant,
+    decided: Option<Reply>,
 }
 
 enum ResponseWaiter {
@@ -325,30 +447,63 @@ fn run_writer(
     mut replica: Option<Replica>,
     receiver: Receiver<Work>,
     changes: &Notify,
-    outgoing: SyncSender<omnipaxos::messages::Message<LogCommand>>,
+    outgoing: SyncSender<Outgoing>,
     timeout: Duration,
 ) -> Result<()> {
     let mut pending = BTreeMap::<Uuid, Pending>::new();
     let mut expiry_requests = BTreeMap::<i64, (u64, Uuid, Instant)>::new();
     let mut was_leader = false;
+    let mut last_tick = Instant::now();
     loop {
         match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(Work::Read(job)) => job(&store, &state),
             Ok(Work::Maintenance(job)) => job(&mut store, &state),
+            Ok(Work::ReplicaRead(job)) => job(&store, &state, replica.as_ref()),
+            Ok(Work::Catchup(frame, reply)) => {
+                let result = replica
+                    .as_mut()
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            Code::FailedPrecondition,
+                            "local mode cannot receive catch-up",
+                        )
+                    })
+                    .and_then(|replica| replica.install_catchup(&mut store, frame));
+                if let Err(error) = &result
+                    && error.is_storage_fault()
+                {
+                    return Err(error.clone());
+                }
+                if reply.send(result).is_err() {
+                    tracing::debug!("catch-up receipt waiter canceled");
+                }
+            }
             Ok(Work::Barrier(reply)) => {
                 if let Some(replica) = &mut replica {
                     let id = Uuid::new_v4();
                     let command = LogCommand::Barrier { id };
-                    replica.propose(command.clone())?;
-                    pending.insert(
-                        id,
-                        Pending {
-                            command,
-                            response: ResponseWaiter::Barrier(reply),
-                            deadline: Instant::now() + timeout,
-                            retried: Instant::now(),
-                        },
-                    );
+                    match replica.propose(command.clone()) {
+                        Err(error) => {
+                            if error.is_storage_fault() {
+                                return Err(error);
+                            }
+                            if reply.send(Err(error)).is_err() {
+                                tracing::debug!("fenced barrier waiter canceled");
+                            }
+                        }
+                        Ok(()) => {
+                            pending.insert(
+                                id,
+                                Pending {
+                                    command,
+                                    response: ResponseWaiter::Barrier(reply),
+                                    deadline: Instant::now() + timeout,
+                                    retried: Instant::now(),
+                                    decided: None,
+                                },
+                            );
+                        }
+                    }
                 } else {
                     let result = store.advance_barrier();
                     if reply.send(result).is_err() {
@@ -368,16 +523,36 @@ fn run_writer(
                         principal,
                         request,
                     };
-                    replica.propose(command.clone())?;
-                    pending.insert(
-                        id,
-                        Pending {
-                            command,
-                            response: ResponseWaiter::Mutation(reply),
-                            deadline: Instant::now() + timeout,
-                            retried: Instant::now(),
-                        },
-                    );
+                    let admission = if store.transition()?.is_some() {
+                        Err(RpcError::new(
+                            Code::Unavailable,
+                            "membership transition is fencing new mutations",
+                        ))
+                    } else {
+                        replica.propose(command.clone())
+                    };
+                    match admission {
+                        Err(error) => {
+                            if error.is_storage_fault() {
+                                return Err(error);
+                            }
+                            if reply.send(Err(error)).is_err() {
+                                tracing::debug!("fenced proposal waiter canceled");
+                            }
+                        }
+                        Ok(()) => {
+                            pending.insert(
+                                id,
+                                Pending {
+                                    command,
+                                    response: ResponseWaiter::Mutation(reply),
+                                    deadline: Instant::now() + timeout,
+                                    retried: Instant::now(),
+                                    decided: None,
+                                },
+                            );
+                        }
+                    }
                 } else {
                     let before = store.revision();
                     let kind = request.kind();
@@ -417,15 +592,40 @@ fn run_writer(
                 }
             }
             Ok(Work::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            Ok(Work::Peer(message)) => {
+            Ok(Work::Peer {
+                configuration_id,
+                sender_id,
+                message,
+                admission,
+            }) => {
+                let _admission = admission;
                 let replica = replica
                     .as_mut()
                     .ok_or_else(|| RpcError::corrupt("peer packet sent to local mode"))?;
-                replica.receive(message)?;
+                if let Err(error) = replica.receive(configuration_id, sender_id, message) {
+                    if error.is_storage_fault() {
+                        return Err(error);
+                    }
+                    tracing::warn!(error = %error, "stale or invalid peer work rejected");
+                }
             }
-            Ok(Work::Reconnected(pid)) => {
+            Ok(Work::Reconnected(configuration_id, pid)) => {
                 if let Some(replica) = &mut replica {
-                    replica.reconnected(pid)?;
+                    replica.reconnected(configuration_id, pid)?;
+                }
+            }
+            Ok(Work::Lead(reply)) => {
+                let result = replica.as_mut().map_or_else(
+                    || {
+                        Err(RpcError::new(
+                            Code::FailedPrecondition,
+                            "local mode has no transferable peer leadership",
+                        ))
+                    },
+                    Replica::attempt_leadership,
+                );
+                if reply.send(result).is_err() {
+                    tracing::debug!("leadership request waiter canceled");
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -436,9 +636,13 @@ fn run_writer(
             ));
         }
         if let Some(replica) = &mut replica {
-            replica.tick()?;
+            if last_tick.elapsed() >= Duration::from_millis(20) {
+                replica.tick(&store)?;
+                last_tick = Instant::now();
+            }
             state.epoch = replica.term();
             state.leader_id = replica.leader();
+            state.decided_index = replica.decided_index(&store)?;
             let leader = replica.is_leader();
             if leader && !was_leader {
                 state.deadlines.clear();
@@ -447,8 +651,36 @@ fn run_writer(
             }
             was_leader = leader;
             let before = store.revision();
-            for (id, mut result) in replica.apply(&mut store)? {
-                if let Some(waiter) = pending.remove(&id) {
+            let applied = replica.apply(&mut store)?;
+            state.cluster = Some(replica.configuration.clone());
+            state.epoch = replica.term();
+            state.leader_id = replica.leader();
+            state.decided_index = replica.decided_index(&store)?;
+            for (id, mut result) in applied {
+                if result
+                    .as_ref()
+                    .is_err_and(|error| !error.is_storage_fault())
+                {
+                    for (_, request, retried) in expiry_requests.values_mut() {
+                        if *request == id {
+                            *request = Uuid::new_v4();
+                            *retried = Instant::now();
+                        }
+                    }
+                }
+                if let Some(mut waiter) = pending.remove(&id) {
+                    if let Ok(Some(Reply::Membership(reply))) = &result
+                        && reply.transition
+                    {
+                        waiter.decided = result.clone()?;
+                        pending.insert(id, waiter);
+                        continue;
+                    }
+                    if matches!(result, Ok(None))
+                        && let Some(reply) = waiter.decided.take()
+                    {
+                        result = Ok(Some(reply));
+                    }
                     if let Ok(Some(reply)) = &mut result
                         && let Some(header) = reply.header_mut()
                     {
@@ -514,8 +746,15 @@ fn run_writer(
                 }
             }
             for pending in pending.values_mut() {
-                if pending.retried.elapsed() >= Duration::from_millis(250) {
-                    replica.propose(pending.command.clone())?;
+                if pending.decided.is_none()
+                    && pending.retried.elapsed() >= Duration::from_millis(250)
+                {
+                    if let Err(error) = replica.propose(pending.command.clone()) {
+                        if error.is_storage_fault() {
+                            return Err(error);
+                        }
+                        tracing::debug!(error = %error, "pending proposal remains fenced");
+                    }
                     pending.retried = Instant::now();
                 }
             }
@@ -530,11 +769,46 @@ fn run_writer(
                     }
                 }
             }
-            if !leader {
+            if replica.removed() {
+                for (_, waiter) in pending {
+                    match waiter.response {
+                        ResponseWaiter::Mutation(sender) => {
+                            let mut result = waiter.decided.ok_or_else(|| {
+                                RpcError::new(
+                                    Code::Unavailable,
+                                    "member removed; outstanding mutation outcome is uncertain",
+                                )
+                            });
+                            if let Ok(reply) = &mut result
+                                && let Some(header) = reply.header_mut()
+                            {
+                                *header = state.header(&store);
+                            }
+                            if sender.send(result).is_err() {
+                                tracing::debug!("self-removal response abandoned");
+                            }
+                        }
+                        ResponseWaiter::Barrier(sender) => {
+                            if sender
+                                .send(Err(RpcError::new(
+                                    Code::Unavailable,
+                                    "member permanently removed",
+                                )))
+                                .is_err()
+                            {
+                                tracing::debug!("removed read waiter canceled");
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            if !replica.is_leader() || store.transition()?.is_some() {
                 continue;
             }
         } else {
             state.leader_id = Some(store.identity().member_id);
+            state.decided_index = store.applied_index();
         }
         let expired: Vec<_> = state
             .deadlines
@@ -564,12 +838,28 @@ fn run_writer(
                 continue;
             }
             let before = store.revision();
-            store.command(
+            if expiry_requests
+                .get(&id)
+                .is_some_and(|(current, _, retried)| {
+                    *current == generation && retried.elapsed() < Duration::from_millis(250)
+                })
+            {
+                continue;
+            }
+            let request = Uuid::new_v4();
+            let result = store.command(
                 store.applied_index() + 1,
-                Uuid::new_v4(),
+                request,
                 Principal::Internal,
                 Mutation::Lease(LeaseCommand::Expire { id, generation }),
-            )?;
+            );
+            if let Err(error) = result {
+                if error.is_storage_fault() {
+                    return Err(error);
+                }
+                tracing::warn!(lease_id = id, error = %error, "lease expiry is blocked; an operator must clear the alarm");
+                expiry_requests.insert(id, (generation, request, Instant::now()));
+            }
             state.refresh_leases(&store)?;
             if before != store.revision() {
                 changes.notify_waiters();

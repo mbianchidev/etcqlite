@@ -484,6 +484,7 @@ impl Store {
                 &request.range_end,
                 false,
             )?;
+            super::maintenance::check_read_health(&transaction)?;
             let result = mvcc::range(&transaction, &metadata, request)?;
             transaction.commit()?;
             Ok(result)

@@ -28,6 +28,32 @@ pub enum StorageError {
 
 type Result<T> = std::result::Result<T, StorageError>;
 
+const RETAINED_LOG_BOUNDS_SQL: &str = "SELECT
+        (SELECT COUNT(*) FROM protocol_entries WHERE configuration_id = ?1),
+        (SELECT MIN(log_idx) FROM protocol_entries WHERE configuration_id = ?1),
+        (SELECT MAX(log_idx) FROM protocol_entries WHERE configuration_id = ?1)";
+
+pub(crate) fn verify_database(connection: &Connection) -> Result<()> {
+    let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'protocol_state')", [], |row| row.get(0))?;
+    if !exists {
+        return Ok(());
+    }
+    let mut statement =
+        connection.prepare("SELECT configuration_id, checksum FROM protocol_state")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let configuration_id: u32 = row.get(0)?;
+        let checksum: Vec<u8> = row.get(1)?;
+        let state = read_state(connection, configuration_id)?;
+        ensure(
+            state_digest(&state)? == checksum,
+            "protocol metadata checksum mismatch",
+        )?;
+        validate_state(connection, configuration_id, &state)?;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct State {
     promise: Option<Vec<u8>>,
@@ -61,7 +87,7 @@ where
         )?;
         crate::sqlite::configure(&connection)?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        ensure(version <= 1, "unsupported protocol storage schema version")?;
+        ensure(version <= 2, "unsupported protocol storage schema version")?;
         connection.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE IF NOT EXISTS protocol_state (
@@ -82,9 +108,11 @@ where
                  checksum BLOB NOT NULL,
                  PRIMARY KEY (configuration_id, log_idx)
              ) STRICT;
-             PRAGMA user_version = 1;
              COMMIT;",
         )?;
+        if version == 0 {
+            connection.pragma_update(None, "user_version", 1)?;
+        }
         let initial = State {
             promise: None,
             accepted_round: None,
@@ -156,16 +184,33 @@ where
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut state = read_state(&transaction, config)?;
-        let immutable_prefix = state.decided;
+        let immutable_prefix = state.decided.min(state.end);
+        let immutable_stopsign = if state.decided > state.end {
+            state.stopsign.clone()
+        } else {
+            None
+        };
         for operation in operations {
             match operation {
                 StorageOp::AppendEntry(entry) => {
+                    ensure(
+                        immutable_stopsign.is_none(),
+                        "cannot append data after a decided StopSign",
+                    )?;
                     append(&transaction, config, &mut state.end, vec![entry])?;
                 }
                 StorageOp::AppendEntries(entries) => {
+                    ensure(
+                        immutable_stopsign.is_none() || entries.is_empty(),
+                        "cannot append data after a decided StopSign",
+                    )?;
                     append(&transaction, config, &mut state.end, entries)?;
                 }
                 StorageOp::AppendOnPrefix(from, entries) => {
+                    ensure(
+                        immutable_stopsign.is_none() || entries.is_empty(),
+                        "cannot append a suffix after a decided StopSign",
+                    )?;
                     let from = index(from)?;
                     ensure(
                         from >= immutable_prefix,
@@ -173,7 +218,10 @@ where
                     )?;
                     ensure(
                         from >= state.compacted && from <= state.end,
-                        "append prefix is outside the stored log",
+                        &format!(
+                            "append prefix {from} is outside configuration {config} log [{}, {}], decided {}",
+                            state.compacted, state.end, state.decided
+                        ),
                     )?;
                     transaction.execute(
                         "DELETE FROM protocol_entries WHERE configuration_id = ?1 AND log_idx >= ?2",
@@ -205,6 +253,10 @@ where
                 }
                 StorageOp::Trim(to) => {
                     let to = index(to)?;
+                    ensure(
+                        immutable_stopsign.is_none() || to <= state.end,
+                        "cannot trim beyond the data prefix of a decided StopSign",
+                    )?;
                     ensure(to >= state.compacted, "trim position cannot decrease")?;
                     transaction.execute(
                         "DELETE FROM protocol_entries WHERE configuration_id = ?1 AND log_idx < ?2",
@@ -213,6 +265,17 @@ where
                     state.end = state.end.max(to);
                 }
                 StorageOp::SetStopsign(stopsign) => {
+                    if let Some(expected) = &immutable_stopsign {
+                        ensure(
+                            stopsign
+                                .as_ref()
+                                .map(serde_json::to_vec)
+                                .transpose()?
+                                .as_ref()
+                                == Some(expected),
+                            "a decided StopSign cannot be replaced or removed",
+                        )?;
+                    }
                     if let Some(stopsign) = &stopsign {
                         ensure(
                             stopsign.next_config.configuration_id > config,
@@ -460,12 +523,9 @@ fn validate_state(connection: &Connection, config: u32, state: &State) -> Result
         .checked_add(i64::from(state.stopsign.is_some()))
         .ok_or_else(|| StorageError::Invariant("accepted position exhausted".into()))?;
     ensure(state.decided <= accepted, "decision exceeds accepted log")?;
-    let (count, first, last): (i64, Option<i64>, Option<i64>) = connection.query_row(
-        "SELECT COUNT(*), MIN(log_idx), MAX(log_idx) FROM protocol_entries
-         WHERE configuration_id = ?1",
-        [config],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+    let (count, first, last): (i64, Option<i64>, Option<i64>) = connection
+        .prepare_cached(RETAINED_LOG_BOUNDS_SQL)?
+        .query_row([config], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
     ensure(
         count == state.end - state.compacted,
         "retained log length mismatch",
@@ -501,7 +561,19 @@ fn append<T: Serialize>(
 }
 
 fn state_digest(state: &State) -> Result<Vec<u8>> {
-    Ok(Sha256::digest(serde_json::to_vec(state)?).to_vec())
+    struct Checksum(Sha256);
+    impl std::io::Write for Checksum {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut checksum = Checksum(Sha256::new());
+    serde_json::to_writer(&mut checksum, state)?;
+    Ok(checksum.0.finalize().to_vec())
 }
 
 fn entry_digest(config: u32, index: i64, payload: &[u8]) -> Vec<u8> {
@@ -510,4 +582,94 @@ fn entry_digest(config: u32, index: i64, payload: &[u8]) -> Vec<u8> {
     digest.update(index.to_be_bytes());
     digest.update(payload);
     digest.finalize().to_vec()
+}
+
+#[cfg(test)]
+mod validation_query_tests {
+    use super::*;
+    use rusqlite::StatementStatus;
+
+    fn fixture() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE protocol_entries (
+                configuration_id INTEGER NOT NULL,
+                log_idx INTEGER NOT NULL CHECK(log_idx >= 0),
+                payload BLOB NOT NULL,
+                checksum BLOB NOT NULL,
+                PRIMARY KEY(configuration_id, log_idx)
+             ) STRICT;
+             WITH RECURSIVE positions(i) AS (
+                SELECT 0 UNION ALL SELECT i + 1 FROM positions WHERE i < 4095
+             )
+             INSERT INTO protocol_entries SELECT 1,i,x'00',x'00' FROM positions;
+             WITH RECURSIVE positions(i) AS (
+                SELECT 40 UNION ALL SELECT i + 1 FROM positions WHERE i < 79
+             )
+             INSERT INTO protocol_entries SELECT 2,i,x'00',x'00' FROM positions;",
+            )
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn exact_bounds_use_the_existing_index_without_aggregating_min_max_per_entry() {
+        let connection = fixture();
+        for (config, count, first, last) in [
+            (1, 4096, Some(0), Some(4095)),
+            (2, 40, Some(40), Some(79)),
+            (3, 0, None, None),
+        ] {
+            let mut statement = connection.prepare(RETAINED_LOG_BOUNDS_SQL).unwrap();
+            let actual: (i64, Option<i64>, Option<i64>) = statement
+                .query_row([config], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap();
+            assert_eq!(actual, (count, first, last));
+            let steps = statement.get_status(StatementStatus::VmStep);
+            assert!(
+                i64::from(steps) <= count * 4 + 100,
+                "configuration {config}: {steps} VM steps for {count} entries"
+            );
+        }
+    }
+
+    #[test]
+    fn full_length_and_boundary_corruption_are_still_rejected() {
+        let connection = fixture();
+        let state = State {
+            promise: None,
+            accepted_round: None,
+            decided: 4096,
+            compacted: 0,
+            end: 4096,
+            stopsign: None,
+            snapshot: None,
+        };
+        validate_state(&connection, 1, &state).unwrap();
+        connection
+            .execute(
+                "DELETE FROM protocol_entries WHERE configuration_id=1 AND log_idx=20",
+                [],
+            )
+            .unwrap();
+        assert!(
+            validate_state(&connection, 1, &state)
+                .unwrap_err()
+                .to_string()
+                .contains("retained log length mismatch")
+        );
+        connection
+            .execute(
+                "INSERT INTO protocol_entries VALUES(1,4096,x'00',x'00')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            validate_state(&connection, 1, &state)
+                .unwrap_err()
+                .to_string()
+                .contains("retained log boundary mismatch")
+        );
+    }
 }

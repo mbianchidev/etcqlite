@@ -12,7 +12,11 @@ target/release/etcqlite init --data-dir ./local-node --name local
 target/release/etcqlite serve --data-dir ./local-node --listen 127.0.0.1:2379
 ```
 
-Initialization is explicit and refuses nonempty data directories. Restart
+Initialization is explicit and refuses nonempty data directories.
+An explicitly supplied `init --quota-bytes <positive-bytes>` persists the logical
+MVCC quota on a fresh node; it is not an online quota change. The default remains
+2 GiB. Qualification uses equal explicitly configured quota limits for candidate
+and reference rather than changing acknowledgment or consistency rules. Restart
 uses the persisted identity. One dedicated writer owns the node lock and
 SQLite application transactions. Ctrl-C/SIGTERM stops admission and drains
 the owned runtime; user data is never deleted.
@@ -28,10 +32,13 @@ plaintext passwords and tokens are not persisted.
 The prototype implements the six KV methods, Watch, all five Lease methods,
 all 17 Auth methods, both Lock methods, and all five Election methods.
 RangeStream intentionally has no REST mapping, matching the pinned source.
-Cluster/Maintenance serving and distributed semantic closure remain separate
-pending gates, not successful no-op methods.
+Cluster and Maintenance now have real handlers. Full differential semantics and
+distributed qualification remain separate gates, not claims implied by 49
+registered RPCs. Snapshot export requires the companion tool installed by
+`make build`/`make install`; `serve --snapshot-tool /path/to/etcqlite-snapshot`
+can select an explicit tool.
 
-## Static clustered experiment
+## Clustered experiment
 
 The native runtime now routes mutations and ordered read barriers through the
 maintained OmniPaxos core and durable SQLite adapter. Apply/result publication
@@ -39,7 +46,7 @@ follows only decided entries. Loss of quorum does not enable local writes or
 default stale reads; explicit serializable reads remain separate.
 
 Use a shared JSON configuration with nonzero `cluster_id`,
-`configuration_id`, and `members`. Each member has `id`, bounded distinct
+initial `configuration_id: 1`, and `members`. Each member has `id`, bounded distinct
 `pid`, `name`, `client_url`, `peer_url`, and optional `learner`.
 Client/peer URLs must be HTTPS. Initialize every fresh node explicitly:
 
@@ -69,11 +76,28 @@ Generate **synthetic development-only** certificates in a new directory:
 go -C tools run ./certs --out /path/to/new-private-test-pki --cluster-id 42 --members 1,2,3
 ```
 
+For isolated guest experiments, `--hosts` accepts an explicit comma-separated
+IP/DNS SAN list. Include only the owned endpoints, for example
+`127.0.0.1,localhost,lima-mock-node.internal`. The helper is development-only,
+uses a short-lived synthetic CA and never grants unlisted hostnames.
+
 The TLS three-voter case verifies replication, one unavailable voter, and
 quorum-loss fencing. This is bounded one-host evidence, not multi-host HA or
-production qualification. Learner activation, dynamic configuration
-transitions, transfer, native recovery, full tooling and long fault/performance
-qualification remain pending and block broader claims.
+production qualification. Dynamic add/remove/update, learner bootstrap/promotion and safe
+leadership transfer have bounded cases. Native recovery, application interchange
+and read-only integration surfaces are runnable; long fault/performance,
+Linux/Kubernetes and cross-project qualification still block broader claims.
+
+New data directories use schema 2. Existing schema-1 nodes require explicit
+`migrate --target 2 --backup <new-native-snapshot>` for dynamic administration.
+Initialization never joins a later configuration with empty votes. Add the
+member, issue its identity-bound certificate, obtain a native snapshot and use
+`join` as described in [recovery](recovery-and-migration.md). Newly joined
+members claim their durable incarnation before voting or client admission.
+
+`/health` and `/readyz` require a quorum barrier and usable read state.
+`/metrics` separates `etcqlite_ready` from `etcqlite_writer_running`; an isolated
+writer is not readiness. Startup emits `started`, not an unproven ready event.
 
 `/version` distinguishes the etcd protocol profile from the actual Etcqlite
 version, commit, and dirty-build status. Response headers carry real persisted
@@ -87,6 +111,13 @@ make install
 target/install/bin/etcqlite --help
 ```
 
+Use [installation](installation.md), [configuration](configuration.md) and
+[logging](logging.md) for user-facing setup and diagnostics. New service file
+logging is under the initialized node's private logs directory by default;
+offline commands retain their existing stdout/stderr behavior.
+For a clean, version-verified developer archive and transactional prefix
+installation, use [local releases](releases.md), not a system-app replacement.
+
 ## Toolchain and checks
 
 Use Rust/Cargo 1.99 or later and Go 1.26 or later. The initial local runs use Rust 1.99.1,
@@ -99,6 +130,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo audit --deny warnings
 go -C tools test ./...
 go -C tools vet ./...
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s script -p 'test_*.py'
+bash script/release.sh --dry-run
 ```
 
 The protocol dependency is the maintained local fork under `vendor/omnipaxos`.
@@ -159,12 +192,14 @@ The pinned Kine module is v0.17.5, commit
 The SQLite baseline supports RangeStream, does not expose AuthStatus, and
 returns an unsupported error for HashKV. It is not the full product scope.
 
-## Offline converter spike
+## Snapshot and inspection tooling
 
 ```sh
 go -C tools build -o ../target/etcqlite-snapshot ./snapshot
 target/etcqlite-snapshot export /path/to/manifest.json /path/to/new-snapshot.db
 target/etcqlite-snapshot import /path/to/snapshot.db /path/to/new-manifest.json
+target/etcqlite-snapshot stage /path/to/snapshot.db /path/to/new-interchange.sqlite
+target/etcqlite-snapshot export-native /path/to/verified-native.snapshot /path/to/new-snapshot.db
 ```
 
 The version-1 manifest preserves complete sorted binary bbolt buckets using
@@ -178,7 +213,14 @@ no-overwrite; files and the parent directory are flushed. Failure removes
 only the operation's staging file, never an existing output or source.
 All manifests and snapshots are sensitive, including their auth records.
 
-This initial spike has a 512-MiB file limit and materializes the manifest.
-It is not yet the large-dataset streaming migration implementation. Full
-native SQLite backup/restore, live API snapshots, application-state import,
-revision/cache policy, and fenced reverse cutover remain M5/M6 obligations.
+The JSON converter retains a 512-MiB manifest limit. Native/bbolt/staged files
+use a separate 16-GiB limit and a 16-MiB per-record limit. Disk-backed staging
+and bounded native export avoid materializing historical KV or the live-value
+map. Verify native inputs with `etcqlite snapshot status` before standalone
+conversion. The staged marker/schema and SHA-256 footer remain sensitive and
+must be excluded from generic scanner/CRUD/replication surfaces.
+Native SQLite backup/restore, live upstream snapshot streams, application-state
+import/export, explicit revision/cache policy and post-write reverse translation
+are implemented experimentally. Measured large-dataset and production recovery
+qualification remain open gates. See [recovery](recovery-and-migration.md) and
+[integrations](integrations.md) for commands, fencing and read-only inspection.

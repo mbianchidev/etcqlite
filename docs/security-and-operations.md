@@ -125,9 +125,13 @@ Audit selected library licenses and maintenance state. Pin reproducible
 versions, review integrity, and surface dependency vulnerabilities rather
 than ignoring install warnings.
 
-Future packaging uses manually run checks and release procedures unless CI
-is explicitly authorized. Signing/notarization and supported-platform
-qualification require real implementation work; no current package exists.
+Local developer packaging uses manually run checks, complete dependency notices,
+strict archive verification and explicit private-prefix activation. It never
+publishes, changes system apps or upgrades live authorities automatically.
+See [installation](installation.md) and [local releases](releases.md).
+Signing/notarization, mixed-version and broader platform qualification remain
+unverified; unsigned development artifacts are not production releases.
 
-GitHub Actions remains disabled in this repository. A documentation merge
-must not introduce workflow files, release automation, or scheduled jobs.
+GitHub Actions remains disabled. The maintainer explicitly approved reviewable
+`.disabled_yaml` workflow templates, not enabled workflows or scheduled jobs.
+Security support/reporting decisions are in [SECURITY.md](../SECURITY.md).

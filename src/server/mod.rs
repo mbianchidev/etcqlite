@@ -1,8 +1,10 @@
 mod auth;
+mod cluster;
 mod concurrency;
 mod gateway;
 mod kv;
 mod lease;
+mod maintenance;
 mod watch;
 
 use crate::{
@@ -36,6 +38,8 @@ pub struct Api {
     password_slots: Arc<Semaphore>,
     watch_slots: Arc<Semaphore>,
     pub(crate) peer_tls: Option<crate::peer::Options>,
+    pub(crate) snapshot_tool: PathBuf,
+    pub(crate) snapshot_slots: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +56,7 @@ pub struct Options {
     pub tls: Option<TlsOptions>,
     pub request_timeout: Duration,
     pub peer: Option<crate::peer::Options>,
+    pub snapshot_tool: Option<PathBuf>,
 }
 
 pub struct RunningServer {
@@ -71,11 +76,11 @@ impl RunningServer {
                 "server shutdown channel disconnected",
             ));
         }
+        let writer = self.worker.shutdown().await;
         let serving = self
             .task
             .await
             .map_err(|error| RpcError::corrupt(format!("server task: {error}")))?;
-        let writer = self.worker.shutdown().await;
         let peer = match self.peer {
             Some(peer) => peer.shutdown().await,
             None => Ok(()),
@@ -85,6 +90,13 @@ impl RunningServer {
 }
 
 pub async fn start(options: Options) -> Result<RunningServer> {
+    let snapshot_tool = match options.snapshot_tool {
+        Some(path) => path,
+        None => std::env::current_exe()?
+            .parent()
+            .ok_or_else(|| RpcError::invalid("server executable has no parent"))?
+            .join("etcqlite-snapshot"),
+    };
     let configuration = {
         let store = crate::storage::Store::open(&options.data_dir)?;
         store
@@ -144,16 +156,20 @@ pub async fn start(options: Options) -> Result<RunningServer> {
     );
     let endpoint = if let Some((configuration, member)) = &configuration {
         let advertised = configuration.member(*member)?.client_url.clone();
-        let uri: axum::http::Uri = advertised
-            .parse()
-            .map_err(|_| RpcError::invalid("persisted client endpoint is invalid"))?;
-        if uri.port_u16() != Some(address.port()) {
-            return Err(RpcError::new(
-                Code::FailedPrecondition,
-                "client listener port does not match the persisted advertised endpoint",
-            ));
+        if advertised.is_empty() {
+            endpoint
+        } else {
+            let uri: axum::http::Uri = advertised
+                .parse()
+                .map_err(|_| RpcError::invalid("persisted client endpoint is invalid"))?;
+            if uri.port_u16() != Some(address.port()) {
+                return Err(RpcError::new(
+                    Code::FailedPrecondition,
+                    "client listener port does not match the persisted advertised endpoint",
+                ));
+            }
+            advertised
         }
-        advertised
     } else {
         endpoint
     };
@@ -187,7 +203,74 @@ pub async fn start(options: Options) -> Result<RunningServer> {
         password_slots: Arc::new(Semaphore::new(4)),
         watch_slots: Arc::new(Semaphore::new(256)),
         peer_tls,
+        snapshot_tool,
+        snapshot_slots: Arc::new(Semaphore::new(2)),
     };
+    let publication = runtime
+        .read(|store, state| {
+            if let Some(configuration) = &state.cluster
+                && (configuration
+                    .member(store.identity().member_id)?
+                    .client_url
+                    .is_empty()
+                    || configuration
+                        .member(store.identity().member_id)?
+                        .name
+                        .is_empty())
+            {
+                Ok(Some((
+                    store.identity().member_id,
+                    store.identity().name.clone(),
+                    store.incarnation()?,
+                )))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?;
+    if let Some((id, name, incarnation)) = publication {
+        let publish_runtime = runtime.clone();
+        let client_url = endpoint.clone();
+        let publish = async move {
+            publish_runtime
+                .mutate(
+                    Principal::Internal,
+                    crate::storage::command::Mutation::Membership(
+                        crate::storage::membership::MembershipCommand::Publish {
+                            id,
+                            name,
+                            client_url,
+                            incarnation,
+                        },
+                    ),
+                )
+                .await
+        };
+        if incarnation.is_some() {
+            if let Err(error) = publish.await {
+                if let Err(cleanup) = worker.shutdown().await {
+                    tracing::error!(error = %cleanup, "failed to stop rejected joining writer");
+                }
+                if let Some(peer) = peer
+                    && let Err(cleanup) = peer.shutdown().await
+                {
+                    tracing::error!(error = %cleanup, "failed to stop rejected joining peer");
+                }
+                return Err(RpcError::new(
+                    error.status().code(),
+                    format!(
+                        "member incarnation registration failed: {error}; restart the same data directory, or remove/add a new member ID for replacement"
+                    ),
+                ));
+            }
+        } else {
+            tokio::spawn(async move {
+                if let Err(error) = publish.await {
+                    tracing::error!(error = %error, "member endpoint publication failed; readiness is incomplete");
+                }
+            });
+        }
+    }
     let routes = Routes::new(
         pb::kv_server::KvServer::new(api.clone())
             .max_decoding_message_size(MAX_REQUEST_BYTES)
@@ -204,6 +287,14 @@ pub async fn start(options: Options) -> Result<RunningServer> {
         pb::watch_server::WatchServer::new(api.clone())
             .max_decoding_message_size(MAX_REQUEST_BYTES)
             .max_encoding_message_size(4 << 20),
+    )
+    .add_service(
+        pb::maintenance_server::MaintenanceServer::new(api.clone())
+            .max_decoding_message_size(MAX_REQUEST_BYTES),
+    )
+    .add_service(
+        pb::cluster_server::ClusterServer::new(api.clone())
+            .max_decoding_message_size(MAX_REQUEST_BYTES),
     )
     .add_service(
         v3lockpb::lock_server::LockServer::new(api.clone())
@@ -255,6 +346,12 @@ impl Api {
         let certificate_name = certificate_name(request)?;
         self.runtime
             .read(move |store, state| {
+                if !store.identity_registered()? {
+                    return Err(RpcError::new(
+                        Code::Unavailable,
+                        "member identity claim is still pending; no client admission",
+                    ));
+                }
                 store.principal(
                     token_hash.as_ref(),
                     certificate_name.as_deref(),
@@ -460,7 +557,7 @@ fn certificate_name<T>(request: &Request<T>) -> std::result::Result<Option<Strin
         .transpose()
 }
 
-fn private_key_permissions(path: &std::path::Path) -> Result<()> {
+pub(crate) fn private_key_permissions(path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

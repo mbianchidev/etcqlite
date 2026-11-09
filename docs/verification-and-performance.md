@@ -4,6 +4,355 @@ Status: manual acceptance contract with bounded M0/M1 tests and synthetic
 reference baselines implemented. See [development](development.md).
 There is no production/performance qualification or CI workflow.
 
+## Current bounded qualification
+
+The installed candidate passes official Go client KV/watch/transaction and
+session/mutex/election workflows. A pinned etcd differential compares HashKV
+history, repeated compaction and retained-floor behavior without normalizing
+away hashes or revision boundaries. That differential found and fixed the
+reference's revision-specific keep-set rules; compaction hashes remain a runtime
+cache and are cleared on restart, matching the pinned reference.
+
+`tools/conformance/kubernetes_test.go` constructs the real Kubernetes v1.37.2
+etcd3 storage adapter and reuses upstream storage assertions for get, create,
+conditional/unconditional delete, paging/prefix lists, conflicting updates, TTL
+and key schema. It does not run a complete kube-apiserver/provider qualification.
+The Go test graph includes upstream reference-server dependencies; the product
+and snapshot converter do not use Raft.
+
+```sh
+ETCQLITE_SERVER=/path/to/installed/etcqlite \
+ETCQLITE_ETCD=/path/to/verified/etcd-v3.7.3 \
+go -C tools test -count=1 ./conformance
+```
+
+Reference startup can produce transient client retry logs; negative reference
+cases deliberately produce duplicate-key/root-precondition errors. Kubernetes
+watch cleanup can log context cancellation. These are recorded observations,
+not permission to suppress unexplained failures.
+
+The owner authorized three new isolated Linux VMs for qualification, each
+4 vCPU/8 GiB with an independent 30-GiB local ext4 disk. The instances use a
+checksum-pinned Ubuntu 24.04 ARM64 image, native VZ virtualization, no host/home
+mounts, no forwarded SSH agent or proxy credentials, and only loopback client
+forwarding. They share one physical host and must not be described as host-level
+HA. Primary throughput, long campaigns and recovery results remain unqualified
+until their actual evidence exists.
+
+The first full primary candidate run at `c626c41271683cd383ac8f086a0aa8a67b09d93a`
+failed: the first guest's server was OOM-killed with 7,786,568 KiB anonymous RSS.
+The client run was stopped and no successful primary percentile/throughput
+result was emitted. The two surviving processes later had approximately
+11-13 MiB anonymous RSS; their roughly 6-GiB cgroup accounting was predominantly
+reclaimable file cache, not equivalent heap growth. Data and failure evidence
+were retained. Subsequent serialization/snapshot changes require a fresh
+same-budget run, not a larger-memory pass or a rewritten success report.
+
+The bounded-transport candidate restarted the preserved three-voter dataset
+without resetting identities or promises: all nodes converged at revision
+37,456 and applied index 144,095. Observed restart RSS stayed below 223 MiB.
+This is a recovery/readiness probe, not a completed primary workload run.
+Large HashKV calls then exposed the bit-at-a-time CRC and owned-writer timeout;
+hash scans now use a pinned read-only WAL view off the writer and accelerated
+Castagnoli CRC with the same reference encoding. Large-tool calls still need
+an appropriate client deadline; the exact primary and recovery gates remain open.
+
+The first complete primary candidate sample at
+`1fec3e7f43c73826f9a88f0479fcb2ed2f536b5f` passed the original resource limits:
+100,000 live keys, 1,000,000 seeded mutations, 100 prefix watches and 32 client
+workers. Actual warmup was 311.33 seconds and measurement 927.31 seconds, with
+zero request, warmup or watch errors. Throughput was 55.65 operations/second;
+per-operation p99 was approximately 1.69-1.88 seconds. Each server's observed
+VmHWM stayed below 25 MiB. The prior OOM result remains retained.
+
+All three replicas subsequently agreed on the exact retained-history HashKV
+value at revision 34,934. A live native image of 5,907,914,784 bytes was captured
+and fully verified, then translated into a 2,414,034,944-byte bbolt image accepted
+by pinned etcdutl v3.7.3 and a private disk-backed interchange. Subsequent fresh
+native and real upstream restores agreed on HashKV 1,758,762,700 at revision
+35,154. Native import took 18.13 seconds and 25,472 KiB peak RSS.
+
+The real upstream destination then accepted binary, delete/recreate, lease and
+auth changes. After fencing it, a new snapshot and disk-backed reverse import
+retained all 100,087 live synthetic keys and exact historical/generation, auth
+and lease assertions. Native and upstream HashKV agreed at 1,974,551,075,
+revision 35,159 and compact revision -1. Reverse import took 16.45 seconds and
+25,472 KiB peak RSS. Both new native images were fully verified and retained.
+This establishes one large isolated application cutover and post-write rollback,
+not a complete RPO/RTO campaign, multi-voter recovery qualification or speed win.
+
+The candidate report retained only two server-version strings due to a reporting
+bug; live discovery/status separately verified all three exact candidate
+identities. The reporting bug is fixed in the subsequent tooling work.
+
+The `tools/qualification` runner seeds synthetic 64-byte keys/1024-byte values
+through durable API transactions, starts fixed prefix watches, and issues exact
+100-operation cycles with the frozen 60/10/20/10 mix. It records exact per-operation
+latencies, including p99/p99.9, errors and warmup errors in new mode-0600 JSON
+reports. It refuses a nonempty fixture namespace, HTTP endpoints, unbounded
+workers, or silent latency sampling. Smaller/shorter probes are explicitly
+`primary_workload_shape: false`, never production evidence.
+
+Reports reserve a new private output before contacting the fixture. Setup,
+seeding, warmup and measurement failures retain their phase, seeded mutation
+count, actual elapsed timing and failure text. SIGINT/SIGTERM stops new requests
+and preserves an incomplete report; exact-sample overflow stops the workload
+without publishing truncated percentiles. Only completed runs with the actual
+primary timing can carry the primary-shape flag. This is evidence retention,
+not an external linearizability checker.
+
+New performance reports use format 2 and include separate `error_details`,
+`warmup_error_details` and `watch_error_details` arrays. Each entry retains the
+operation, terminal gRPC/status code, exact message, count, and first/last
+monotonic nanoseconds relative to that phase's start. Local response-validation
+failures remain explicit `Unknown` errors rather than being reclassified as
+transport failures. These are terminal logical-RPC outcomes, not a claim to
+capture every SDK retry attempt.
+
+Evidence is bounded to 128 distinct entries per phase and 4,096 bytes per message.
+Exceeding either bound fails the run explicitly and suppresses incomplete
+percentiles; errors are not silently dropped or truncated. The five-second
+request deadline and frozen workload/mix remain unchanged. Legacy format-1
+reports are retained as captured; their missing error details are not fabricated
+after the fact.
+
+```sh
+GOMAXPROCS=2 go -C tools run ./qualification \
+  --endpoints https://node1:2379,https://node2:2379,https://node3:2379 \
+  --ca ./fixture-ca.crt --cert ./fixture-client.crt --key ./fixture-client.key \
+  --engine <exact-build> --output ./new-report.json --owned-fixture
+```
+
+Primary candidate/reference nodes use equal explicit 8-GiB quota settings
+alongside their 4-vCPU/8-GiB process budgets. The larger quota permits the
+predeclared retained-history dataset without changing the durability/read
+contract. Sustainable capacity sweeps, five alternating paired samples, full
+fault/history checks and topology disclosure remain required; one successful
+probe does not meet the faster/production gate.
+
+The first pinned three-voter Linux reference sample completed 300.35 seconds
+of warmup and 900.37 seconds of measurement at 5,352.58 operations/second.
+Its per-operation p99 was 37.11-48.32 milliseconds. It nevertheless **failed**:
+six measured requests errored, with zero warmup or watch errors. The report
+retains that failure and must not be used as qualified capacity or a successful
+paired sample. All voters subsequently agreed on HashKV 210,323,461 at revision
+2,114,858; no quota alarm was active. Peak process RSS stayed below 3.3 GiB
+and service memory accounting below 4.7 GiB, within the original budget.
+
+The reference emitted slow-apply/read-index warnings and changed election term
+from 2 to 8. Exact request-error details were not captured by the original
+performance runner, so the six errors remain unexplained rather than attributed
+to a convenient infrastructure cause. Its observed rate is far above the
+candidate's first sample; no speed advantage or passing latency gate exists.
+The reference directories and failed report are retained.
+
+Read-only microprofiling of the verified native image's 154,080 retained protocol
+entries identified avoidable work in each metadata validation. The combined
+`COUNT/MIN/MAX` query took a median 4.70 ms; three exact scalar aggregates in
+one statement took 1.97 ms in alternating warm runs on the same immutable file.
+Separate `MIN`/`MAX` queries use existing index endpoints, while `COUNT` still
+checks every retained entry. The runtime now caches that statement; all
+cardinality, boundary, checksum and transaction/durability checks remain.
+Regression tests bound SQLite VM work and still reject missing/misbounded logs
+and isolate configuration epochs. This is a query microprofile, not distributed
+capacity or a speed advantage. The failed `c09d916` campaign used its frozen
+binary and was not replaced with this later optimization.
+
+## Bounded external histories
+
+`tools/qualification --correctness` uses pinned Porcupine v1.3.1 models for
+register/CAS, atomic two-key read/write, append and set operations. It records
+bounded 512-operation epochs across 16 independent groups with at most 32 workers.
+Timed-out writes remain uncertain, including possible later committed effects;
+they are never silently treated as aborted. Unary SDK calls make one attempt,
+so a successful response cannot hide replayed mutations. Logical append still
+uses explicit compare-and-swap attempts within its bounded request deadline.
+
+The separate watch oracle checks revision order, duplicates, exact previous KV,
+create/version/delete metadata, every acknowledged mutation, and explanations
+for observed uncertain effects. Successful reads and no-op outcomes must agree
+with the watch replay at their reported revision. The final range is pinned by
+its fence revision; later observed pending effects are retained rather than
+discarded. Reconnection occurs only after a complete response, never midway
+through an atomic revision.
+
+Private format-2 JSONL records preserve requested and actual monotonic timing,
+operations, watch evidence, transient interruptions, epoch checks and terminal
+completion/failure. Rechecking rejects unknown/duplicate/null fields, missing
+required fields, wrong array shapes, nonprivate or changing files, missing or
+repeated epochs/checks, and trailing records. Limits are 8 MiB per record and
+16 GiB per streamed file; capture enforces them too. Every epoch has a 30-second
+external-check deadline. An `Unknown` result is failure, not a pass.
+
+A real three-voter host-local smoke trace recorded 512 operations, 267 watch
+events and two reconnects. Both independent oracles accepted the finite trace,
+with 12 deadline-exceeded outcomes retained as uncertain (11 append, one CAS).
+The installed host build was labeled dirty. This checks the tooling, including
+uncertainty; it is not a healthy availability, Linux fault campaign, or
+production qualification result. Legacy format-1 probe evidence remains retained
+but is not accepted by the stronger format-2 rechecker.
+
+```sh
+GOMAXPROCS=2 go -C tools run ./qualification --correctness \
+  --endpoints https://node1:2379,https://node2:2379,https://node3:2379 \
+  --ca ./fixture-ca.crt --cert ./fixture-client.crt --key ./fixture-client.key \
+  --engine <exact-build> --seed 1002 --concurrency 16 --duration 10m \
+  --output ./new-history.jsonl --owned-fixture
+
+go -C tools run ./qualification --check-history ./new-history.jsonl
+```
+
+Namespace reuse and output overwrite are refused. The console reports uncertain
+operation counts explicitly. A successful finite check is not an availability
+or performance result, and does not inject or qualify any faults by itself.
+
+A fresh frozen-Linux smoke run then exposed a producer bug: retained replay
+could synchronously fill its 16-frame output queue before a healthy receiver
+had a chance to run. The 512-operation history was retained as failed rather
+than forgiving the missing watch events. Watch delivery now awaits bounded
+queue space, yielding to the receiver; a five-second sustained stall still
+terminates explicitly. Queue/frame limits, revision order and complete-revision
+semantics remain unchanged. Closed receivers and oversized frames remain
+explicit errors. Long campaigns must use the corrected binary, not silently
+overwrite or reinterpret the failed `1fec3e7` trace.
+
+The matching clean Linux build at `c09d916` subsequently passed 3,072 mixed
+operations in 10.14 seconds and 29,184 operations over 120.23 seconds while one
+identity-pinned voter was paused/resumed for two seconds. Both finite oracles
+passed with zero uncertain outcomes. The same owned three-voter setup attempted
+a six-hour seeded process-pause/mixed-history campaign. It **failed** at epoch
+540 after 540 checked epochs, 276,992 captured operations and 3,674 uncertain
+deadline/cancellation outcomes. The last operation's actual elapsed time was
+12,220.27 seconds, not six hours. An established watch channel closed without
+an error and never caught up to its fenced revision. The failed history and
+fault log were made read-only; further injection was stopped. Neither the
+six-hour nor 24-hour gate passed in that attempt. Large wall/monotonic and
+host/guest timestamp differences were observed and are not normalized into
+qualification time.
+This profile does not cover disk/fsync faults, complete/asymmetric partitions,
+lease/auth behavior or reconfiguration failure campaigns.
+
+The native watch path canceled established watches on temporary writer-read
+errors. The pinned official client can close an established cancellation channel
+without surfacing its reason. Retryable Unavailable/DeadlineExceeded/
+ResourceExhausted read failures now terminate the RPC with their actual status,
+so standard client reconnection can replay retained history. Permanent auth,
+compaction and corruption failures keep their explicit terminal semantics.
+The failed run remains failed; subsequent qualification uses new evidence.
+
+Frozen clean Linux build `b0e5c0d` then restarted the same three preserved voter
+directories normally, retaining cluster/member identities and all promises.
+Before new writes, all replicas still agreed on HashKV 1,590,436,642 at revision
+129,747. A new healthy trace recorded 512 operations, 271 watch events and two
+reconnects over 26.00 seconds with no uncertain outcomes. The coupled short run
+recorded 2,560 operations, 1,338 watch events and ten reconnects over 134.67
+seconds, with four verified two-second pauses across all three voters. Both
+finite oracles and strict offline rechecks passed. One append deadline remained
+uncertain; it was retained, not classified as an abort or a healthy-availability
+pass. All replicas subsequently agreed on HashKV 1,228,291,493 at revision
+131,050. Process VmHWM stayed below 25 MiB; peer relay overload/retransmission
+warnings remain an unresolved operational/performance concern. This is bounded
+recovery/reconnect evidence, not six-hour completion or comparative capacity.
+
+The subsequent supervised seed-5001 run on frozen clean `b0e5c0d` completed
+21,639.565 seconds of actual collector time, exceeding six continuous hours.
+All 521 epochs passed both correctness oracles and the strict offline recheck:
+266,752 operations, 138,622 watch events and 1,034 deliberate watch reconnects.
+The driver completed 118 identity-verified two-second pauses, with matching
+resume receipts for every pause and no further faults after the requested
+deadline. Five transient watch-read `DeadlineExceeded` errors were recorded
+explicitly and recovered without losing the fenced watch history. The largest
+recorded wall/monotonic elapsed disagreement was 0.094 seconds; the fail-closed
+clock guard did not trigger.
+
+All three unchanged process/birth/executable identities survived the run, then
+agreed on revision 243,145, applied/decided index 1,375,989 and full-history
+HashKV 4,032,088,378, compact revision -1. Process VmHWM stayed below 27 MiB
+and service MemoryPeak below 360 MiB within the unchanged 4-vCPU/8-GiB budgets.
+The completed history and fault log are retained mode 0400 with SHA256 evidence.
+Only the three verified synthetic services were stopped after final agreement;
+the VMs and every voter directory remain intact.
+
+This passes the continuous six-hour **correctness/duration** gate for the
+declared single-voter process-pause profile, not a production or availability
+gate. All 2,297 uncertain deadline/cancellation outcomes remain in the history,
+including 1,368 append outcomes; none were silently treated as aborted.
+Peer relay/outbox overload and retransmission warnings persist. The 24-hour
+aggregate matrix, crash/disk/fsync/partition/lease/auth/reconfiguration
+campaigns, recovery RPO/RTO and comparative capacity/latency gates remain open.
+
+### Coupled process-pause driver
+
+`scripts/qualification_campaign.py` launches the collector as its own child and
+checks its exit status at least once per second and again before each pause.
+There is no independent fault driver left running after collector failure.
+A driver failure or SIGINT/SIGTERM stops only that owned child, first with a
+ten-second graceful wait, then a ten-second bounded forced wait if necessary.
+The guest command validates the active unit's MainPID, process owner, birth
+ticks, executable SHA256 and exact `--data-dir` argument before STOP and CONT.
+An EXIT/HUP/INT/TERM trap resumes that same verified process after an interrupted
+pause. Never use this driver against an existing workload or an unapproved VM.
+
+Prepare a new private JSON profile from the actual running fixture identities:
+
+```json
+{
+  "status": "prepared",
+  "production_claim": false,
+  "candidate": "<full-lowercase-40-hex-source-commit>",
+  "linux_binary_sha256": "<full-lowercase-64-hex-executable-sha256>",
+  "requested_seconds": 21600,
+  "fault_interval_seconds": 180,
+  "fault_pause_seconds": 2,
+  "seed": 5001,
+  "concurrency": 16,
+  "unit": "etcqlite-qual-fixture.service",
+  "data_relative_path": "etcqlite-qualification/fixture/node",
+  "executable_relative_path": "etcqlite-qualification/runtime-frozen/etcqlite",
+  "nodes": [
+    {"vm": "etcqlite-qual-fixture-1", "pid": 101, "birth_ticks": 201},
+    {"vm": "etcqlite-qual-fixture-2", "pid": 102, "birth_ticks": 202},
+    {"vm": "etcqlite-qual-fixture-3", "pid": 103, "birth_ticks": 203}
+  ]
+}
+```
+
+Replace every example identity, path and hash; use a never-used seed and new
+history/fault-log paths. The profile is limited to 64 KiB, rejects duplicate
+fields/nonstandard numbers and validates scalar types and path components.
+If present, `status` must be `prepared`, not an existing failed or active run.
+VM name prefixes and `--owned-fixture` attest the operator's explicit
+authorization; discovering a profile is not permission to run it.
+Python 3 and Porto must already be installed; the Python driver uses only the
+standard library. Build the existing Go collector first:
+
+```sh
+go -C tools build -o ../target/tools/etcqlite-qualification ./qualification
+make test-campaign
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/qualification_campaign.py \
+  --profile ./private/new-profile.json --owned-fixture \
+  --qualifier ./target/tools/etcqlite-qualification \
+  --history ./private/new-history.jsonl --fault-log ./private/new-fault.jsonl \
+  --endpoints https://node1:2379,https://node2:2379,https://node3:2379 \
+  --ca ./fixture-ca.crt --cert ./fixture-client.crt --key ./fixture-client.key
+```
+
+The next pause is scheduled one interval after the preceding pause completes;
+delays never cause catch-up bursts. At the requested deadline no further pauses
+start, and the collector has at most 300 seconds to finish its current bounded
+epoch. A successful collector exit still requires the strict offline history
+recheck, with a 900-second total deadline, before recording completion.
+Fault evidence is exclusively created mode 0600 and flushed/fsynced per record.
+Failed or interrupted evidence is never removed or overwritten.
+
+An unplanned control-loop gap over five seconds, a backwards monotonic step,
+or wall/monotonic elapsed disagreement over five seconds fails clock continuity
+and terminates the run as interrupted. The explicitly bounded guest pause can
+occupy at most twenty seconds; it does not waive wall/monotonic continuity.
+Host suspend or clock changes must not be turned into claimed qualification
+time. This policy does not change laptop power settings or clocks, and a short
+driver acceptance is not a six-hour or production gate.
+
 **No CI is authorized.** Run future checks manually in isolated development
 workspaces after implementation is requested. Do not enable Actions or add
 workflows merely because this document describes repeatable checks.

@@ -8,6 +8,12 @@ remains disabled. See [development](development.md) for runnable checks.
 
 | Document | Purpose |
 | --- | --- |
+| [Installation](installation.md) | Source/developer packages, isolated prefixes, first KV workflow and explicit offline updates |
+| [Configuration](configuration.md) | Actual CLI surfaces, defaults, paths and credential boundaries |
+| [Logging](logging.md) | Private streams, settings, redaction, rotation, retention and failure diagnostics |
+| [Troubleshooting](troubleshooting.md) | Safe diagnostics and recovery without deleting user data |
+| [Local releases](releases.md) | Real local package/install verification, provenance and deliberately disabled CI templates |
+| [Dependency notices](dependency-licenses.md) | Runtime inventory, immutable upstream license evidence and retained third-party terms |
 | [Development](development.md) | Manual build/test commands, pinned tools, and current implementation boundary |
 | [Requirements](requirements.md) | Confirmed requirements, proposed product boundary, non-goals, and success criteria |
 | [Alternatives and positioning](alternatives.md) | Competitor comparison, proposed USP, evidence boundaries, and reuse decisions |
@@ -33,3 +39,8 @@ acceptance evidence rather than treating an unchecked task list as proof.
 Implementation, dependency installation, and isolated runtime experiments are
 authorized. Changes to other repositories, live migration, and CI enablement
 still require separate authorization. Checks remain manual.
+
+The maintainer approved MIT licensing, private security/conduct reporting and
+local distribution work. [Contributing](../CONTRIBUTING.md) directs agents to
+[AGENTS.md](../AGENTS.md). Workflow templates use `.disabled_yaml` by explicit
+request and are not active CI.
