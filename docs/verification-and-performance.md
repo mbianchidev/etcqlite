@@ -226,8 +226,9 @@ deadline/cancellation outcomes. The last operation's actual elapsed time was
 12,220.27 seconds, not six hours. An established watch channel closed without
 an error and never caught up to its fenced revision. The failed history and
 fault log were made read-only; further injection was stopped. Neither the
-six-hour nor 24-hour gate passed. Large wall/monotonic and host/guest timestamp
-differences were observed and are not normalized into qualification time.
+six-hour nor 24-hour gate passed in that attempt. Large wall/monotonic and
+host/guest timestamp differences were observed and are not normalized into
+qualification time.
 This profile does not cover disk/fsync faults, complete/asymmetric partitions,
 lease/auth behavior or reconfiguration failure campaigns.
 
@@ -237,7 +238,7 @@ without surfacing its reason. Retryable Unavailable/DeadlineExceeded/
 ResourceExhausted read failures now terminate the RPC with their actual status,
 so standard client reconnection can replay retained history. Permanent auth,
 compaction and corruption failures keep their explicit terminal semantics.
-The failed run remains failed; a new bounded acceptance and campaign are required.
+The failed run remains failed; subsequent qualification uses new evidence.
 
 Frozen clean Linux build `b0e5c0d` then restarted the same three preserved voter
 directories normally, retaining cluster/member identities and all promises.
@@ -252,6 +253,33 @@ pass. All replicas subsequently agreed on HashKV 1,228,291,493 at revision
 131,050. Process VmHWM stayed below 25 MiB; peer relay overload/retransmission
 warnings remain an unresolved operational/performance concern. This is bounded
 recovery/reconnect evidence, not six-hour completion or comparative capacity.
+
+The subsequent supervised seed-5001 run on frozen clean `b0e5c0d` completed
+21,639.565 seconds of actual collector time, exceeding six continuous hours.
+All 521 epochs passed both correctness oracles and the strict offline recheck:
+266,752 operations, 138,622 watch events and 1,034 deliberate watch reconnects.
+The driver completed 118 identity-verified two-second pauses, with matching
+resume receipts for every pause and no further faults after the requested
+deadline. Five transient watch-read `DeadlineExceeded` errors were recorded
+explicitly and recovered without losing the fenced watch history. The largest
+recorded wall/monotonic elapsed disagreement was 0.094 seconds; the fail-closed
+clock guard did not trigger.
+
+All three unchanged process/birth/executable identities survived the run, then
+agreed on revision 243,145, applied/decided index 1,375,989 and full-history
+HashKV 4,032,088,378, compact revision -1. Process VmHWM stayed below 27 MiB
+and service MemoryPeak below 360 MiB within the unchanged 4-vCPU/8-GiB budgets.
+The completed history and fault log are retained mode 0400 with SHA256 evidence.
+Only the three verified synthetic services were stopped after final agreement;
+the VMs and every voter directory remain intact.
+
+This passes the continuous six-hour **correctness/duration** gate for the
+declared single-voter process-pause profile, not a production or availability
+gate. All 2,297 uncertain deadline/cancellation outcomes remain in the history,
+including 1,368 append outcomes; none were silently treated as aborted.
+Peer relay/outbox overload and retransmission warnings persist. The 24-hour
+aggregate matrix, crash/disk/fsync/partition/lease/auth/reconfiguration
+campaigns, recovery RPO/RTO and comparative capacity/latency gates remain open.
 
 ### Coupled process-pause driver
 

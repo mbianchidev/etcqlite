@@ -11,9 +11,11 @@ reversible application translation, and read-only integration endpoints now
 have bounded synthetic evidence, including a multi-GiB application cutover and
 post-write reverse restore. Opt-in Porto and sql-not-so-lite wiring is merged
 in the approved integration repositories. The first full Linux candidate sample
-passed its resource gate; comparative performance and long fault qualification
-remain open. The earlier OOM evidence is retained. GitHub Actions remains
-disabled. No production, full-compatibility, or speed claim is made.
+passed its resource gate. One continuous six-hour process-pause/history run
+passed its correctness gate; availability, comparative performance and broader
+fault qualification remain open. Earlier OOM and failed long-run evidence is
+retained. GitHub Actions remains disabled. No production, full-compatibility,
+or speed claim is made.
 
 ## Development and scope
 
