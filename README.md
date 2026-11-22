@@ -1,3 +1,5 @@
+<img src="docs/assets/logo.svg" width="96" height="96" alt="Etcqlite logo">
+
 # Etcqlite
 
 [Docs](docs/README.md) | [Issues](https://github.com/mbianchidev/etcqlite/issues/new/choose) | [Roadmap](docs/implementation-plan.md)
